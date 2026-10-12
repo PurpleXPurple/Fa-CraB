@@ -1771,9 +1771,9 @@ class MainWindow(QMainWindow):
         self._worker: Optional[CrawlWorker] = None
         self._session_start = time.time()
 
+        self._build_central()
         self._build_menus()
         self._build_toolbar()
-        self._build_central()
         self._build_statusbar()
         self._wire_signals()
         self._load_geometry()
