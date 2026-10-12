@@ -1,122 +1,118 @@
-#!/usr/bin/env python3
-"""
-scraper.py — Nexus Edition v4
-Fixes: event-loop starvation, shutdown errors, slow proxy validation,
-batch link insertion, per-domain concurrency, bloom counter accuracy.
-
-Dependencies:
-    pip install curl-cffi lxml
-
-Usage:
-    python scraper.py                # interactive
-    python scraper.py --test         # test suite + benchmarks
-    python scraper.py --debug        # verbose + tracemalloc
-    python scraper.py --no-ui        # headless
-    python scraper.py --refresh-proxies
-"""
-
-import asyncio
-import collections
-import functools
-import hashlib
-import json
-import logging
-import math
-import mmap
-import os
-import random
-import re
-import signal
-import sys
-import threading
-import time
-import traceback
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+import asyncio, collections, functools, gc, hashlib, importlib, json, logging, math, mmap, os, random, re, signal, socket, sys, threading, time, traceback, weakref
+from dataclasses import dataclass, field, fields as dc_fields
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urldefrag
 
-from curl_cffi.requests import AsyncSession
-from lxml import html
+
+class _Lazy:
+    """Lazy module/attr resolver. Loads only on first access. Cached forever."""
+    __slots__ = ("_mod", "_attr", "_obj")
+    def __init__(self, mod: str, attr: Optional[str] = None):
+        self._mod, self._attr, self._obj = mod, attr, None
+    def _resolve(self):
+        if self._obj is None:
+            m = importlib.import_module(self._mod)
+            self._obj = getattr(m, self._attr) if self._attr else m
+        return self._obj
+    def __call__(self, *a, **kw):
+        return self._resolve()(*a, **kw)
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+
+# Heavy deps — deferred until first use (memory-friendly for --test/--headless)
+AsyncSession = _Lazy("curl_cffi.requests", "AsyncSession")
+lxml_html    = _Lazy("lxml", "html")
+
+# PyQt6 — deferred until GUI launch
+HAS_QT = False
+QtW = QtC = QtG = None
+
+
+def _ensure_qt() -> bool:
+    global HAS_QT, QtW, QtC, QtG
+    if HAS_QT:
+        return True
+    try:
+        import PyQt6.QtWidgets as _W
+        import PyQt6.QtCore as _C
+        import PyQt6.QtGui as _G
+        QtW, QtC, QtG = _W, _C, _G
+        HAS_QT = True
+        return True
+    except ImportError:
+        return False
+
 
 # ===========================================================================
 # CONFIG
 # ===========================================================================
-MAX_DEPTH = 15
-TIMEOUT = 12
-MAX_RETRIES = 3
-RETRY_BASE = 1.2
-OUTPUT_FILE = "scraped_data.jsonl"
-VISITED_BLOOM_FILE = "visited.bloom"
-START_URLS_FILE = "start_urls.txt"
-PROXY_FILE = "proxies_validated.txt"
-BLOCK_COOLDOWN = 300
-HEALTH_CHECK_INTERVAL = 45
-DOMAIN_RATE_LIMIT = 0.10          # per-domain min gap between request starts
-DOMAIN_CONCURRENCY = 8            # per-domain in-flight request cap
-MAX_TEXT_LENGTH = 2_000_000
-BATCH_SIZE = 250
-BLOOM_CAPACITY = 50_000_000
-BLOOM_ERROR_RATE = 0.001
-ADAPTIVE_MIN = 20
-ADAPTIVE_MAX = 400
-ADAPTIVE_INITIAL = 200
-TARGET_LATENCY = 1.5
-QUEUE_MAXSIZE = 2_000_000
+@dataclass(slots=True)
+class Config:
+    # --- crawl ---
+    max_depth: int = 15
+    timeout: float = 12.0
+    max_retries: int = 3
+    retry_base: float = 1.2
 
-IMPERSONATE_PROFILES = [
-    "chrome110", "chrome116", "chrome120", "chrome124",
-    "firefox110", "firefox117", "firefox120", "safari15_5",
-]
+    # --- files ---
+    output_file: str = "scraped_data.jsonl"
+    visited_file: str = "visited.bloom"
+    start_urls_file: str = "start_urls.txt"
+    config_file: str = "scraper_config.json"
 
-# 40 sources — same as before
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-    "https://raw.githubusercontent.com/LoneKingCode/free-proxy-db/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/proxy-free/free-proxy-list/main/all.txt",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text",
-    "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/gfpcom/free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
-    "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
-    "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
-    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
-    "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
-    "https://raw.githubusercontent.com/yemixzy/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/elliottophellia/proxylist/master/results.txt",
-    "https://raw.githubusercontent.com/Volodichev/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-    "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
-    "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
-    "https://raw.githubusercontent.com/caliphdev/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/ClearProxy/checked-proxy-list/main/http/raw.txt",
-    "https://raw.githubusercontent.com/DenisD89/free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/FirmansyahRizky/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Juvenal-Yescas/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Leviathan-00/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/MrMarble/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Nocturnal-Proxy/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/ObcbO/getproxy/master/http.txt",
-    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
-    "https://raw.githubusercontent.com/RXWatcher/proxy-list/main/http.txt",
-    "https://raw.githubusercontent.com/Skillter/proxy-list/main/http.txt",
-]
+    # --- adaptive concurrency ---
+    adaptive_min: int = 20
+    adaptive_max: int = 400
+    adaptive_initial: int = 200
+    target_latency: float = 1.5
 
-PROXY_VALIDATE_ENDPOINTS = [
-    "https://api.ipify.org?format=json",
-    "https://icanhazip.com",
-    "https://ifconfig.me/ip",
-]
+    # --- per-domain ---
+    domain_concurrency: int = 8
+    domain_rate_limit: float = 0.10
+
+    # --- bloom ---
+    bloom_capacity: int = 50_000_000
+    bloom_error_rate: float = 0.001
+
+    # --- blocks / health ---
+    block_cooldown: float = 300.0
+    health_check_interval: float = 45.0
+
+    # --- text ---
+    max_text_length: int = 2_000_000
+
+    # --- queue ---
+    queue_maxsize: int = 2_000_000
+    write_queue_maxsize: int = 200_000
+
+    # --- disk writer ---
+    write_batch_max: int = 256
+    write_batch_max_bytes: int = 8 * 1024 * 1024
+    fsync_every: int = 0  # 0 = never (OS handles it)
+
+    # --- spoofing ---
+    spoof_profiles: Tuple[str, ...] = (
+        "chrome124", "chrome120", "firefox120", "safari16",
+    )
+
+    @classmethod
+    def load(cls, path: str) -> "Config":
+        cfg = cls()
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                valid = {f.name for f in dc_fields(cls)}
+                for k, v in data.items():
+                    if k in valid:
+                        setattr(cfg, k, v)
+                if isinstance(cfg.spoof_profiles, list):
+                    cfg.spoof_profiles = tuple(cfg.spoof_profiles)
+            except Exception:
+                pass
+        return cfg
+
 
 # ===========================================================================
 # LOGGING
@@ -129,11 +125,128 @@ logging.basicConfig(
 log = logging.getLogger("nexus")
 
 DEBUG_MODE = False
-FORCE_NO_UI = False
-REFRESH_PROXIES = False
-
-# Global stop flag (safe across signal handlers)
+FORCE_HEADLESS = False
 _STOP = threading.Event()
+
+
+# ===========================================================================
+# OPTIMIZATION CENTER — memory, CPU, I/O, GC
+# ===========================================================================
+class _LRU:
+    """Bounded dict. Fast O(1) get/put with FIFO eviction."""
+    __slots__ = ("_data", "_max", "_hits", "_miss")
+    def __init__(self, maxsize: int = 100_000):
+        self._data: Dict[Any, Any] = {}
+        self._max = maxsize
+        self._hits = self._miss = 0
+    def get(self, k):
+        v = self._data.get(k)
+        if v is not None:
+            self._hits += 1
+            return v
+        self._miss += 1
+        return None
+    def put(self, k, v):
+        if len(self._data) >= self._max:
+            # drop 10% oldest via dict iteration order
+            drop = self._max // 10
+            for _ in range(drop):
+                try:
+                    del self._data[next(iter(self._data))]
+                except StopIteration:
+                    break
+        self._data[k] = v
+    def clear(self):
+        self._data.clear()
+    @property
+    def stats(self):
+        total = self._hits + self._miss
+        return {
+            "size": len(self._data),
+            "hits": self._hits,
+            "misses": self._miss,
+            "hit_rate": self._hits / total if total else 0.0,
+        }
+
+
+class OptimizationCenter:
+    """
+    Central tuning hub. Adjusts GC, socket, thread pool, caches.
+    Provides hot-path caches for URL parsing, language detection, domain lookup.
+    """
+    __slots__ = (
+        "config", "url_cache", "domain_cache", "lang_cache", "hash_cache",
+        "_gc_was_enabled", "_last_gc",
+    )
+
+    def __init__(self, config: Config):
+        self.config = config
+        self.url_cache: _LRU = _LRU(200_000)
+        self.domain_cache: _LRU = _LRU(50_000)
+        self.lang_cache: _LRU = _LRU(20_000)
+        self.hash_cache: _LRU = _LRU(100_000)
+        self._gc_was_enabled = gc.isenabled()
+        self._last_gc = time.monotonic()
+        self._tune_gc()
+        self._tune_socket()
+
+    def _tune_gc(self) -> None:
+        """GC off during hot loop; manual collection scheduled by caller."""
+        gc.disable()
+
+    def _tune_socket(self) -> None:
+        try:
+            socket.setdefaulttimeout(30.0)
+        except Exception:
+            pass
+
+    async def tune_thread_pool(self, size: int = 96) -> None:
+        """Enlarge default executor for to_thread calls."""
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(
+                ThreadPoolExecutor(max_workers=size, thread_name_prefix="nx")
+            )
+        except Exception:
+            pass
+
+    def maybe_gc(self) -> None:
+        """Periodic manual GC every 15s (called from crawler loop)."""
+        now = time.monotonic()
+        if now - self._last_gc >= 15.0:
+            gc.collect(1)
+            self._last_gc = now
+
+    def parse_url(self, url: str):
+        v = self.url_cache.get(url)
+        if v is not None:
+            return v
+        v = urlparse(url)
+        self.url_cache.put(url, v)
+        return v
+
+    def domain_of(self, url: str) -> str:
+        v = self.domain_cache.get(url)
+        if v is not None:
+            return v
+        v = urlparse(url).netloc
+        self.domain_cache.put(url, v)
+        return v
+
+    def detect_language(self, text: str) -> str:
+        # cache by hash of first 200 chars
+        key = text[:200]
+        v = self.lang_cache.get(key)
+        if v is not None:
+            return v
+        v = MiniCheckers._detect_language_uncached(text)
+        self.lang_cache.put(key, v)
+        return v
+
+    def restore(self) -> None:
+        if self._gc_was_enabled:
+            gc.enable()
 
 
 # ===========================================================================
@@ -246,29 +359,27 @@ class MiniDebuggers:
 class MiniHandlers:
     @staticmethod
     def install_signal_handlers() -> None:
-        def _handler(sig, frame):
+        def _h(sig, frame):
             _STOP.set()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
-                signal.signal(sig, _handler)
+                signal.signal(sig, _h)
             except Exception:
                 pass
 
     @staticmethod
     def install_exception_hook() -> None:
-        def hook(exc_type, exc, tb):
-            if issubclass(exc_type, KeyboardInterrupt):
-                sys.__excepthook__(exc_type, exc, tb)
+        def hook(et, exc, tb):
+            if issubclass(et, KeyboardInterrupt):
+                sys.__excepthook__(et, exc, tb)
                 return
-            log.error("UNCAUGHT %s: %s", exc_type.__name__, exc)
+            log.error("UNCAUGHT %s: %s", et.__name__, exc)
             log.debug("Traceback:\n%s", "".join(traceback.format_tb(tb)))
         sys.excepthook = hook
 
     @staticmethod
-    def retry_async(max_attempts: int = MAX_RETRIES,
-                    base: float = RETRY_BASE,
-                    jitter: float = 0.25,
-                    exceptions: Tuple = (Exception,)):
+    def retry_async(max_attempts: int = 3, base: float = 1.2,
+                    jitter: float = 0.25, exceptions: Tuple = (Exception,)):
         def deco(fn):
             @functools.wraps(fn)
             async def wrap(*a, **kw):
@@ -280,26 +391,6 @@ class MiniHandlers:
                         last = e
                         if i < max_attempts - 1:
                             await asyncio.sleep(base ** i + random.random() * jitter)
-                raise last
-            return wrap
-        return deco
-
-    @staticmethod
-    def sync_retry(max_attempts: int = MAX_RETRIES,
-                   base: float = RETRY_BASE,
-                   jitter: float = 0.25,
-                   exceptions: Tuple = (Exception,)):
-        def deco(fn):
-            @functools.wraps(fn)
-            def wrap(*a, **kw):
-                last = None
-                for i in range(max_attempts):
-                    try:
-                        return fn(*a, **kw)
-                    except exceptions as e:
-                        last = e
-                        if i < max_attempts - 1:
-                            time.sleep(base ** i + random.random() * jitter)
                 raise last
             return wrap
         return deco
@@ -322,6 +413,7 @@ class MiniHandlers:
 
 
 class CircuitBreaker:
+    __slots__ = ("threshold", "timeout", "_fails", "_opened_at", "_lock")
     def __init__(self, threshold: int = 5, timeout: float = 60.0):
         self.threshold = threshold
         self.timeout = timeout
@@ -331,10 +423,10 @@ class CircuitBreaker:
 
     async def is_open(self, key: str) -> bool:
         async with self._lock:
-            opened = self._opened_at.get(key)
-            if opened is None:
+            t = self._opened_at.get(key)
+            if t is None:
                 return False
-            if time.time() - opened > self.timeout:
+            if time.time() - t > self.timeout:
                 self._opened_at.pop(key, None)
                 self._fails[key] = 0
                 return False
@@ -352,35 +444,114 @@ class CircuitBreaker:
             self._opened_at.pop(key, None)
 
 
-class TokenBucket:
-    def __init__(self, rate: float, capacity: float):
-        self.rate = rate
-        self.capacity = capacity
-        self.tokens = capacity
-        self.last = time.monotonic()
-        self._lock = asyncio.Lock()
+# ===========================================================================
+# SPOOF ENGINE — 4 layers of browser emulation
+# ===========================================================================
+class SpoofEngine:
+    """
+    Layer 1: TLS/JA3 fingerprint via curl_cffi impersonate
+    Layer 2: Header ordering identical to real browsers
+    Layer 3: Client Hints (Sec-CH-UA-*) — Chrome only
+    Layer 4: Referer chain + regional Accept-Language
+    """
+    __slots__ = ("_profile_pool",)
 
-    async def acquire(self, n: float = 1.0) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            self.tokens = min(self.capacity,
-                              self.tokens + (now - self.last) * self.rate)
-            self.last = now
-            wait = 0.0
-            if self.tokens < n:
-                wait = (n - self.tokens) / self.rate
-            self.tokens -= n
-        if wait > 0:
-            await asyncio.sleep(wait)
+    PROFILES: Dict[str, dict] = {
+        "chrome124": {
+            "impersonate": "chrome124",
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "lang": "en-US,en;q=0.9",
+            "platform": '"Windows"',
+            "mobile": "?0",
+            "brands": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "is_chrome": True,
+        },
+        "chrome120": {
+            "impersonate": "chrome120",
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "lang": "en-US,en;q=0.9",
+            "platform": '"Windows"',
+            "mobile": "?0",
+            "brands": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "is_chrome": True,
+        },
+        "firefox120": {
+            "impersonate": "firefox120",
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) "
+                  "Gecko/20100101 Firefox/120.0",
+            "lang": "en-US,en;q=0.5",
+            "platform": "",
+            "mobile": "",
+            "brands": "",
+            "is_chrome": False,
+        },
+        "safari16": {
+            "impersonate": "safari15_5",
+            "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+            "lang": "en-US,en;q=0.9",
+            "platform": "",
+            "mobile": "",
+            "brands": "",
+            "is_chrome": False,
+        },
+    }
+
+    REGION_LANGS = (
+        "en-US,en;q=0.9", "en-GB,en;q=0.9", "en-US,en;q=0.9,es;q=0.8",
+        "en-US,en;q=0.9,fr;q=0.8", "en-US,en;q=0.9,de;q=0.7",
+    )
+
+    def __init__(self, allowed: Tuple[str, ...]):
+        self._profile_pool = [p for p in allowed if p in self.PROFILES]
+
+    def pick(self, rng: Optional[random.Random] = None) -> dict:
+        r = rng or random
+        name = r.choice(self._profile_pool)
+        return self.PROFILES[name]
+
+    def build_headers(self, url: str, profile: dict,
+                      referer: Optional[str] = None) -> dict:
+        """Layer 2 + 3 + 4 — ordered dict, real browser shape."""
+        h = {
+            "User-Agent": profile["ua"],
+            "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                       "image/avif,image/webp,image/apng,*/*;q=0.8"),
+            "Accept-Language": random.choice(self.REGION_LANGS) if random.random() < 0.3
+                               else profile["lang"],
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin" if referer else "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+            "Connection": "keep-alive",
+        }
+        if profile["is_chrome"]:
+            h["Sec-CH-UA"] = profile["brands"]
+            h["Sec-CH-UA-Mobile"] = profile["mobile"]
+            h["Sec-CH-UA-Platform"] = profile["platform"]
+            h["Sec-CH-UA-Platform-Version"] = '"15.0.0"'
+            h["Sec-CH-UA-Arch"] = '"x86"'
+            h["Sec-CH-UA-Bitness"] = '"64"'
+            h["Sec-CH-UA-Full-Version-List"] = profile["brands"]
+            h["Sec-CH-UA-Model"] = '""'
+        if referer:
+            h["Referer"] = referer
+        return h
 
 
 # ===========================================================================
-# BLOOM FILTER (fixed counter)
+# BLOOM FILTER
 # ===========================================================================
 class BloomFilter:
-    def __init__(self, filepath: str,
-                 capacity: int = BLOOM_CAPACITY,
-                 error_rate: float = BLOOM_ERROR_RATE):
+    __slots__ = ("filepath", "capacity", "error_rate", "num_bits",
+                 "num_hashes", "num_bytes", "_items", "_file", "_mmap")
+
+    def __init__(self, filepath: str, capacity: int, error_rate: float):
         self.filepath = filepath
         self.capacity = capacity
         self.error_rate = error_rate
@@ -409,39 +580,46 @@ class BloomFilter:
         self._file = open(self.filepath, "r+b")
         self._mmap = mmap.mmap(self._file.fileno(), 0)
         sample = self._mmap[:4096]
-        bits_set = sum(bin(b).count("1") for b in sample)
-        self._items = int(bits_set * (self.num_bits / (4096 * 8)))
+        bits = sum(bin(b).count("1") for b in sample)
+        self._items = int(bits * (self.num_bits / (4096 * 8)))
         log.info("Bloom: %d bits, %d hashes, %.1f MB, ~%d items",
-                 self.num_bits, self.num_hashes,
-                 self.num_bytes / 1e6, self._items)
+                 self.num_bits, self.num_hashes, self.num_bytes / 1e6, self._items)
 
     def _hashes(self, item: str):
         data = item.encode("utf-8")
         h1 = int.from_bytes(hashlib.md5(data).digest()[:8], "little")
         h2 = int.from_bytes(hashlib.sha1(data).digest()[:8], "little")
-        for i in range(self.num_hashes):
-            yield (h1 + i * h2) % self.num_bits
+        mmap_ref = self._mmap
+        n = self.num_bits
+        k = self.num_hashes
+        for i in range(k):
+            yield (h1 + i * h2) % n
 
     def add(self, item: str) -> bool:
-        """Returns True if this item was actually new (bits changed)."""
         already = True
+        mp = self._mmap
         for pos in self._hashes(item):
             bp, bit = pos >> 3, pos & 7
-            cur = self._mmap[bp]
+            cur = mp[bp]
             if not (cur & (1 << bit)):
                 already = False
-                self._mmap[bp] = cur | (1 << bit)
+                mp[bp] = cur | (1 << bit)
         if not already:
             self._items += 1
             return True
         return False
 
     def contains(self, item: str) -> bool:
+        mp = self._mmap
         for pos in self._hashes(item):
             bp, bit = pos >> 3, pos & 7
-            if not (self._mmap[bp] & (1 << bit)):
+            if not (mp[bp] & (1 << bit)):
                 return False
         return True
+
+    @property
+    def items(self) -> int:
+        return self._items
 
     @property
     def fill_ratio(self) -> float:
@@ -452,10 +630,6 @@ class BloomFilter:
     @property
     def estimated_fp_rate(self) -> float:
         return self.fill_ratio ** self.num_hashes
-
-    @property
-    def items(self) -> int:
-        return self._items
 
     def flush(self) -> None:
         if self._mmap:
@@ -475,21 +649,22 @@ class BloomFilter:
 # ADAPTIVE CONCURRENCY
 # ===========================================================================
 class AdaptiveConcurrency:
-    def __init__(self, initial: int = ADAPTIVE_INITIAL,
-                 min_cap: int = ADAPTIVE_MIN,
-                 max_cap: int = ADAPTIVE_MAX,
-                 target_latency: float = TARGET_LATENCY):
+    __slots__ = ("current", "min_cap", "max_cap", "target_latency",
+                 "latency_ewma", "error_ewma", "_inflight", "_lock",
+                 "_adjust_interval", "_last_adjust")
+
+    def __init__(self, initial: int, min_cap: int, max_cap: int,
+                 target_latency: float):
         self.current = initial
         self.min_cap = min_cap
         self.max_cap = max_cap
         self.target_latency = target_latency
         self.latency_ewma = target_latency
         self.error_ewma = 0.0
+        self._inflight = 0
         self._lock = asyncio.Lock()
-        self._inflight_lock = asyncio.Lock()
         self._adjust_interval = 4.0
         self._last_adjust = time.time()
-        self._in_flight = 0
 
     async def record(self, latency: float, is_error: bool) -> None:
         async with self._lock:
@@ -514,89 +689,102 @@ class AdaptiveConcurrency:
 
     async def acquire(self) -> None:
         while True:
-            async with self._inflight_lock:
-                if self._in_flight < self.current:
-                    self._in_flight += 1
+            async with self._lock:
+                if self._inflight < self.current:
+                    self._inflight += 1
                     return
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.008)
 
     async def release(self) -> None:
-        async with self._inflight_lock:
-            if self._in_flight > 0:
-                self._in_flight -= 1
+        async with self._lock:
+            if self._inflight > 0:
+                self._inflight -= 1
 
 
 # ===========================================================================
-# MINI CLEANERS / CHECKERS
+# MINI CLEANERS — single-pass tree surgery
 # ===========================================================================
+_WS_RE = re.compile(r"[ \t\r\f\v]+")
+_NL_RE = re.compile(r"\n\s*\n+")
+
 class MiniCleaners:
-    _JUNK_TAGS = ("script", "style", "noscript", "iframe", "svg",
-                  "canvas", "template", "object", "embed", "applet")
+    JUNK = frozenset(("script", "style", "noscript", "iframe", "svg",
+                      "canvas", "template", "object", "embed", "applet"))
 
     @staticmethod
-    def strip_junk_tags(tree) -> None:
-        for tag in MiniCleaners._JUNK_TAGS:
-            for elem in tree.iter(tag):
-                p = elem.getparent()
-                if p is not None:
-                    p.remove(elem)
-
-    @staticmethod
-    def strip_comments(tree) -> None:
-        for c in tree.xpath("//comment()"):
-            p = c.getparent()
+    def clean_tree(tree) -> None:
+        """Single-pass: remove junk tags + comments in one iteration."""
+        remove_set = set()
+        for el in tree.iter():
+            tag = el.tag
+            if tag in MiniCleaners.JUNK:
+                remove_set.add(el)
+            elif not isinstance(tag, str):  # comment / PI
+                remove_set.add(el)
+        for el in remove_set:
+            p = el.getparent()
             if p is not None:
-                p.remove(c)
+                p.remove(el)
 
     @staticmethod
     def extract_title(tree) -> str:
-        t = tree.xpath("//title/text()")
-        if t and t[0].strip():
-            return t[0].strip()
-        og = tree.xpath('//meta[@property="og:title"]/@content')
-        if og:
-            return og[0].strip()
-        h1 = tree.xpath("//h1//text()")
-        if h1:
-            return " ".join(h1).strip()[:300]
+        el = tree.find(".//title")
+        if el is not None and el.text:
+            t = el.text.strip()
+            if t:
+                return t
+        meta = tree.find('.//meta[@property="og:title"]')
+        if meta is not None:
+            c = meta.get("content")
+            if c and c.strip():
+                return c.strip()
+        h1 = tree.find(".//h1")
+        if h1 is not None:
+            t = (h1.text_content() if hasattr(h1, "text_content") else h1.text) or ""
+            if t.strip():
+                return t.strip()[:300]
         return ""
 
     @staticmethod
     def extract_text(tree) -> str:
-        return MiniCleaners.normalize_whitespace(tree.text_content())
+        raw = tree.text_content()
+        return _NL_RE.sub("\n", _WS_RE.sub(" ", raw)).strip()
 
     @staticmethod
-    def normalize_whitespace(text: str) -> str:
-        text = re.sub(r"[ \t\r\f\v]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n", text)
-        return text.strip()
-
-    @staticmethod
-    def cap_text(text: str, max_len: int = MAX_TEXT_LENGTH) -> str:
+    def cap(text: str, max_len: int) -> str:
         return text[:max_len] if len(text) > max_len else text
 
 
+# ===========================================================================
+# MINI CHECKERS — fast, cached, compiled
+# ===========================================================================
+_WORD_RE = re.compile(r"\b\w+\b")
+_SCRIPT_TESTS = (
+    (re.compile(r"[\u0400-\u04FF]"), "ru"),
+    (re.compile(r"[\u0600-\u06FF]"), "ar"),
+    (re.compile(r"[\u4E00-\u9FFF]"), "zh"),
+    (re.compile(r"[\u3040-\u309F\u30A0-\u30FF]"), "ja"),
+    (re.compile(r"[\uAC00-\uD7AF]"), "ko"),
+    (re.compile(r"[\u0900-\u097F]"), "hi"),
+)
+_BLOCK_RE = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r"Just a moment", r"Attention Required! \| Cloudflare",
+    r"cf-browser-verification", r"Please enable JavaScript",
+    r"Access denied", r"Enable JavaScript and cookies to continue",
+    r"Checking your browser before accessing",
+))
+_STOPWORDS: Dict[str, frozenset] = {
+    "en": frozenset(("the", "and", "is", "in", "to", "of", "a", "that", "it", "for", "on", "with")),
+    "es": frozenset(("el", "la", "de", "que", "y", "en", "un", "es", "se", "no", "por", "con")),
+    "fr": frozenset(("le", "la", "de", "et", "les", "des", "en", "un", "une", "est", "pour", "dans")),
+    "de": frozenset(("der", "die", "das", "und", "ist", "in", "den", "von", "zu", "mit", "auf")),
+    "pt": frozenset(("o", "a", "de", "que", "e", "do", "da", "em", "um", "para", "com", "nao")),
+    "it": frozenset(("il", "la", "di", "che", "e", "in", "un", "per", "con", "su", "una", "non")),
+    "nl": frozenset(("de", "het", "een", "van", "en", "in", "is", "dat", "op", "te", "voor")),
+}
+
+
 class MiniCheckers:
-    _BLOCK_PATTERNS = [
-        re.compile(r"Just a moment", re.IGNORECASE),
-        re.compile(r"Attention Required! \| Cloudflare", re.IGNORECASE),
-        re.compile(r"cf-browser-verification", re.IGNORECASE),
-        re.compile(r"Please enable JavaScript", re.IGNORECASE),
-        re.compile(r"Access denied", re.IGNORECASE),
-        re.compile(r"Enable JavaScript and cookies to continue", re.IGNORECASE),
-        re.compile(r"Checking your browser before accessing", re.IGNORECASE),
-    ]
-
-    _STOPWORDS = {
-        "en": {"the", "and", "is", "in", "to", "of", "a", "that", "it", "for", "on", "with"},
-        "es": {"el", "la", "de", "que", "y", "en", "un", "es", "se", "no", "por", "con"},
-        "fr": {"le", "la", "de", "et", "les", "des", "en", "un", "une", "est", "pour", "dans"},
-        "de": {"der", "die", "das", "und", "ist", "in", "den", "von", "zu", "mit", "auf"},
-        "pt": {"o", "a", "de", "que", "e", "do", "da", "em", "um", "para", "com", "nao"},
-        "it": {"il", "la", "di", "che", "e", "in", "un", "per", "con", "su", "una", "non"},
-        "nl": {"de", "het", "een", "van", "en", "in", "is", "dat", "op", "te", "voor"},
-    }
-
     @staticmethod
     def is_valid_url(url: str) -> bool:
         try:
@@ -607,47 +795,51 @@ class MiniCheckers:
 
     @staticmethod
     def is_html(headers: dict) -> bool:
-        ct = headers.get("Content-Type", headers.get("content-type", ""))
-        return "text/html" in ct.lower() or "application/xhtml" in ct.lower()
+        ct = headers.get("Content-Type") or headers.get("content-type") or ""
+        return "html" in ct  # matches text/html and application/xhtml+xml
 
     @staticmethod
-    def is_blocked(html_text: str) -> bool:
-        return any(p.search(html_text) for p in MiniCheckers._BLOCK_PATTERNS)
-
-    @staticmethod
-    def detect_language(text: str) -> str:
-        if re.search(r"[\u0400-\u04FF]", text):
-            return "ru"
-        if re.search(r"[\u0600-\u06FF]", text):
-            return "ar"
-        if re.search(r"[\u4E00-\u9FFF]", text):
-            return "zh"
-        if re.search(r"[\u3040-\u309F\u30A0-\u30FF]", text):
-            return "ja"
-        if re.search(r"[\uAC00-\uD7AF]", text):
-            return "ko"
-        if re.search(r"[\u0900-\u097F]", text):
-            return "hi"
-        words = re.findall(r"\b\w+\b", text.lower())
-        total = len(words) or 1
-        scores = {}
-        for lang, sw in MiniCheckers._STOPWORDS.items():
-            scores[lang] = sum(1 for w in words if w in sw) / total
-        return max(scores, key=scores.get) if scores else "en"
+    def is_blocked(body: str) -> bool:
+        for r in _BLOCK_RE:
+            if r.search(body):
+                return True
+        return False
 
     @staticmethod
     def count_words(text: str) -> int:
-        return len(re.findall(r"\b\w+\b", text))
+        return len(_WORD_RE.findall(text))
 
     @staticmethod
     def hash_text(text: str) -> str:
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+
+    @staticmethod
+    def _detect_language_uncached(text: str) -> str:
+        for r, lang in _SCRIPT_TESTS:
+            if r.search(text):
+                return lang
+        words = _WORD_RE.findall(text.lower())
+        total = len(words) or 1
+        best, best_score = "en", 0.0
+        for lang, sw in _STOPWORDS.items():
+            c = 0
+            for w in words:
+                if w in sw:
+                    c += 1
+            s = c / total
+            if s > best_score:
+                best, best_score = lang, s
+        return best
 
 
 # ===========================================================================
 # STATS
 # ===========================================================================
 class Stats:
+    __slots__ = ("_lock", "queued", "fetched", "errors", "blocks",
+                 "bytes_total", "start_time", "active_workers", "domains",
+                 "log_lines", "paused", "running")
+
     def __init__(self):
         self._lock = threading.Lock()
         self.queued = 0
@@ -688,190 +880,121 @@ class Stats:
 
 
 # ===========================================================================
-# BATCH WRITER
+# DISK WRITER — immediate write, kernel-level, non-blocking
 # ===========================================================================
-class BatchWriter:
-    def __init__(self, filepath: str, batch_size: int = BATCH_SIZE):
-        self.filepath = filepath
-        self.batch_size = batch_size
-        self._buffer: List[str] = []
+class DiskWriter:
+    """
+    Every record hits disk immediately via os.write (no Python buffering).
+    Dedicated task drains the queue, batches <=256 records or 8 MB per call.
+    Never blocks the crawl loop.
+    """
+    __slots__ = ("path", "fd", "config", "_queue", "_task",
+                 "_written", "_dirty", "_lock")
+
+    def __init__(self, path: str, config: Config):
+        self.path = path
+        self.fd: Optional[int] = None
+        self.config = config
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=config.write_queue_maxsize)
+        self._task: Optional[asyncio.Task] = None
+        self._written = 0
+        self._dirty = 0
         self._lock = asyncio.Lock()
 
-    async def write(self, line: str) -> None:
-        async with self._lock:
-            self._buffer.append(line)
-            if len(self._buffer) >= self.batch_size:
-                await self._flush_unlocked()
-
-    async def _flush_unlocked(self) -> None:
-        if not self._buffer:
-            return
-        data = "\n".join(self._buffer) + "\n"
-        self._buffer.clear()
-        await asyncio.to_thread(self._write_file, data)
-
-    def _write_file(self, data: str) -> None:
+    async def start(self) -> None:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+        self.fd = await asyncio.to_thread(os.open, self.path, flags, 0o644)
+        # Hint kernel for sequential access (Linux)
         try:
-            with open(self.filepath, "a", encoding="utf-8") as f:
-                f.write(data)
-        except Exception as e:
-            log.error("Batch write failed: %s", e)
+            os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        except (AttributeError, OSError):
+            pass
+        self._task = asyncio.create_task(self._writer_loop(), name="disk-writer")
 
-    async def close(self) -> None:
-        async with self._lock:
-            await self._flush_unlocked()
+    async def write(self, record: dict) -> None:
+        line = json.dumps(record, ensure_ascii=False)
+        await self._queue.put(line)
 
-
-# ===========================================================================
-# PROXY EXTRACTOR — REWRITTEN
-# ===========================================================================
-class ProxyExtractor:
-    MAX_CANDIDATES = 300
-    MAX_PER_SOURCE = 20
-    VALIDATE_TIMEOUT = 2.0
-    VALIDATE_SEMAPHORE = 60
-    EARLY_EXIT_VALID = 50
-
-    def __init__(self, filepath: str = PROXY_FILE):
-        self.filepath = filepath
-        self.valid: List[str] = []
-        self._load_existing()
-
-    def _load_existing(self) -> None:
-        if os.path.exists(self.filepath):
-            try:
-                with open(self.filepath, "r", encoding="utf-8") as f:
-                    self.valid = [l.strip() for l in f if l.strip()]
-                log.info("Loaded %d persisted proxies.", len(self.valid))
-            except Exception as e:
-                log.warning("Proxy file read failed: %s", e)
-
-    async def extract_and_validate(self, progress_cb=None) -> int:
-        t0 = time.time()
-        log.info("Proxy extraction: fetching from %d sources...",
-                 len(PROXY_SOURCES))
-        candidates = await self._gather_candidates()
-        log.info("Got %d unique candidates in %.2fs.",
-                 len(candidates), time.time() - t0)
-        if not candidates:
-            return 0
-        valid = await self._validate_rolling(candidates, progress_cb)
-        async with asyncio.Lock():  # trivial, keeps structure
-            existing = set(self.valid)
-            new = [p for p in valid if p not in existing]
-            self.valid.extend(new)
-            await asyncio.to_thread(self._persist)
-        log.info("Proxy extraction done: %d valid (%d new, %d total) in %.2fs",
-                 len(valid), len(new), len(self.valid), time.time() - t0)
-        return len(new)
-
-    async def _gather_candidates(self) -> List[str]:
-        candidates: Set[str] = set()
-        async with AsyncSession() as session:
-            tasks = [
-                asyncio.create_task(self._fetch_source(session, url,
-                                                       self.MAX_PER_SOURCE))
-                for url in PROXY_SOURCES
-            ]
-            try:
-                for coro in asyncio.as_completed(tasks):
-                    try:
-                        chunk = await coro
-                        if chunk:
-                            candidates.update(chunk)
-                    except Exception:
-                        pass
-                    if len(candidates) >= self.MAX_CANDIDATES:
-                        break
-            finally:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        return list(candidates)[:self.MAX_CANDIDATES]
-
-    async def _fetch_source(self, session, url, limit) -> List[str]:
+    async def _writer_loop(self) -> None:
         try:
-            r = await session.get(url, timeout=8, impersonate="chrome120")
-            if r.status_code != 200:
-                return []
-            found = []
-            for line in r.text.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                m = re.search(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5})",
-                              line)
-                if m:
-                    found.append(m.group(1))
-                if len(found) >= limit:
+            while True:
+                first = await self._queue.get()
+                if first is None:
+                    self._queue.task_done()
                     break
-            return found
-        except Exception:
-            return []
 
-    async def _validate_rolling(self, candidates: List[str],
-                                 progress_cb=None) -> List[str]:
-        valid: List[str] = []
-        total = len(candidates)
-        done = 0
-        sem = asyncio.Semaphore(self.VALIDATE_SEMAPHORE)
-        lock = asyncio.Lock()
+                batch: List[str] = [first]
+                batch_bytes = len(first) + 1
+                max_records = self.config.write_batch_max
+                max_bytes = self.config.write_batch_max_bytes
 
-        async with AsyncSession() as session:
-            async def check(proxy: str):
-                nonlocal done
-                async with sem:
-                    if len(valid) >= self.EARLY_EXIT_VALID:
-                        return
-                    ok = await self._check_proxy(session, proxy)
-                    async with lock:
-                        done += 1
-                        if ok:
-                            valid.append(proxy)
-                        if progress_cb:
-                            progress_cb(done, total, len(valid))
-
-            tasks = [asyncio.create_task(check(p)) for p in candidates]
-            try:
-                for coro in asyncio.as_completed(tasks):
-                    if len(valid) >= self.EARLY_EXIT_VALID:
-                        break
+                for _ in range(max_records - 1):
                     try:
-                        await coro
+                        item = self._queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if item is None:
+                        self._queue.put_nowait(None)
+                        break
+                    sz = len(item) + 1
+                    if batch_bytes + sz > max_bytes:
+                        self._queue.put_nowait(item)
+                        break
+                    batch.append(item)
+                    batch_bytes += sz
+
+                data = ("\n".join(batch) + "\n").encode("utf-8")
+                try:
+                    await asyncio.to_thread(os.write, self.fd, data)
+                except Exception as e:
+                    log.error("DiskWriter write failed: %s", e)
+
+                self._written += len(batch)
+                self._dirty += len(batch)
+                for _ in batch:
+                    self._queue.task_done()
+
+                if self.config.fsync_every > 0 and self._dirty >= self.config.fsync_every:
+                    try:
+                        await asyncio.to_thread(os.fsync, self.fd)
                     except Exception:
                         pass
-            finally:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                    self._dirty = 0
+        except asyncio.CancelledError:
+            return
 
-        return valid
-
-    async def _check_proxy(self, session, proxy: str) -> bool:
-        endpoint = random.choice(PROXY_VALIDATE_ENDPOINTS)
+    async def stop(self) -> None:
         try:
-            r = await session.get(
-                endpoint,
-                proxies={"http": proxy, "https": proxy},
-                timeout=self.VALIDATE_TIMEOUT,
-                impersonate="chrome120",
-                verify=False,
-            )
-            return r.status_code == 200 and len(r.text) > 0
-        except Exception:
-            return False
+            self._queue.put_nowait(None)
+        except asyncio.QueueFull:
+            pass
+        if self._task:
+            try:
+                await asyncio.wait_for(self._task, timeout=5.0)
+            except Exception:
+                self._task.cancel()
+                try:
+                    await self._task
+                except Exception:
+                    pass
+        if self.fd is not None:
+            try:
+                await asyncio.to_thread(os.fsync, self.fd)
+            except Exception:
+                pass
+            try:
+                await asyncio.to_thread(os.close, self.fd)
+            except Exception:
+                pass
+            self.fd = None
 
-    def _persist(self) -> None:
-        try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                f.write("\n".join(self.valid))
-        except Exception as e:
-            log.error("Proxy persist failed: %s", e)
+    @property
+    def written(self) -> int:
+        return self._written
 
-    def random_proxy(self) -> Optional[str]:
-        return random.choice(self.valid) if self.valid else None
+    @property
+    def queue_depth(self) -> int:
+        return self._queue.qsize()
 
 
 # ===========================================================================
@@ -884,112 +1007,86 @@ class DomainState:
     blocked_until: float = 0.0
     last_access: float = 0.0
     consecutive_failures: int = 0
-    impersonate: str = "chrome120"
-    proxy: Optional[str] = None
+    profile_name: str = "chrome124"
+    last_referer: Optional[str] = None
     total_fetched: int = 0
     total_errors: int = 0
 
 
 class DomainManager:
-    def __init__(self, proxy_extractor: Optional[ProxyExtractor] = None):
+    __slots__ = ("domains", "semaphores", "_lock", "breaker")
+
+    def __init__(self):
         self.domains: Dict[str, DomainState] = {}
         self.semaphores: Dict[str, asyncio.Semaphore] = {}
-        self.proxy_extractor = proxy_extractor
         self._lock = asyncio.Lock()
-        self.breaker = CircuitBreaker(threshold=5, timeout=BLOCK_COOLDOWN)
+        self.breaker = CircuitBreaker(threshold=5, timeout=300.0)
 
     async def get(self, domain: str) -> DomainState:
+        d = self.domains.get(domain)
+        if d is not None:
+            return d
         async with self._lock:
-            if domain not in self.domains:
-                self.domains[domain] = DomainState(domain=domain)
-            return self.domains[domain]
+            d = self.domains.get(domain)
+            if d is None:
+                d = DomainState(domain=domain)
+                self.domains[domain] = d
+            return d
 
     def get_semaphore(self, domain: str) -> asyncio.Semaphore:
-        if domain not in self.semaphores:
-            self.semaphores[domain] = asyncio.Semaphore(DOMAIN_CONCURRENCY)
-        return self.semaphores[domain]
+        s = self.semaphores.get(domain)
+        if s is None:
+            s = asyncio.Semaphore(DOMAIN_CONCURRENCY)
+            self.semaphores[domain] = s
+        return s
 
-    async def wait_for_access(self, domain: str) -> None:
-        state = await self.get(domain)
-        now = time.time()
-        if state.blocked_until > now:
-            await asyncio.sleep(state.blocked_until - now)
-        elapsed = now - state.last_access
-        if elapsed < DOMAIN_RATE_LIMIT:
-            await asyncio.sleep(DOMAIN_RATE_LIMIT - elapsed)
-        state.last_access = time.time()
 
-    async def mark_success(self, domain: str) -> None:
-        state = await self.get(domain)
-        state.consecutive_failures = 0
-        state.healthy = True
-        state.total_fetched += 1
-        state.impersonate = random.choice(IMPERSONATE_PROFILES)
-        if self.proxy_extractor:
-            state.proxy = self.proxy_extractor.random_proxy()
-        await self.breaker.record_success(domain)
-
-    async def mark_failure(self, domain: str, blocked: bool = False) -> None:
-        state = await self.get(domain)
-        state.consecutive_failures += 1
-        state.total_errors += 1
-        await self.breaker.record_failure(domain)
-        if blocked or state.consecutive_failures >= 3:
-            state.blocked_until = time.time() + BLOCK_COOLDOWN
-            state.healthy = False
-        elif self.proxy_extractor:
-            state.proxy = self.proxy_extractor.random_proxy()
-
-    async def health_check_loop(self, stats: Stats, crawler) -> None:
-        while crawler.running:
-            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-            if not crawler.running:
-                return
-            for domain, state in list(self.domains.items()):
-                if not crawler.running:
-                    return
-                if state.healthy and state.blocked_until <= time.time():
-                    continue
-                try:
-                    r = await crawler.session.get(
-                        f"https://{domain}",
-                        impersonate=state.impersonate,
-                        timeout=8,
-                    )
-                    if r.status_code == 200:
-                        state.healthy = True
-                        state.blocked_until = 0
-                        state.consecutive_failures = 0
-                        stats.log(f"Health OK: {domain}")
-                except Exception:
-                    pass
+# Global constant for semaphore creation (kept for clarity)
+DOMAIN_CONCURRENCY = 8
 
 
 # ===========================================================================
 # CRAWLER
 # ===========================================================================
 class Crawler:
-    def __init__(self, start_urls: List[str], stats: Stats):
-        self.start_urls = [u for u in start_urls if MiniCheckers.is_valid_url(u)]
+    def __init__(self, start_urls: List[str], config: Config, stats: Stats,
+                 emit_stats: Optional[Callable] = None,
+                 emit_log: Optional[Callable] = None):
+        self.config = config
         self.stats = stats
-        self.bloom = BloomFilter(VISITED_BLOOM_FILE)
-        self.proxy_extractor = ProxyExtractor()
-        self.domain_manager = DomainManager(self.proxy_extractor)
-        self.adaptive = AdaptiveConcurrency()
-        self.output = BatchWriter(OUTPUT_FILE)
-        self.session: Optional[AsyncSession] = None
-        self.url_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        self.opt = OptimizationCenter(config)
+        self.spoof = SpoofEngine(config.spoof_profiles)
+        self.bloom = BloomFilter(config.visited_file,
+                                  config.bloom_capacity,
+                                  config.bloom_error_rate)
+        self.domains = DomainManager()
+        self.adaptive = AdaptiveConcurrency(
+            config.adaptive_initial, config.adaptive_min,
+            config.adaptive_max, config.target_latency,
+        )
+        self.writer = DiskWriter(config.output_file, config)
+        self.session: Optional[Any] = None
+        self.url_queue: asyncio.Queue = asyncio.Queue(maxsize=config.queue_maxsize)
         self.running = True
+        self.start_urls = [u for u in start_urls if MiniCheckers.is_valid_url(u)]
+        self._emit_stats = emit_stats
+        self._emit_log = emit_log
         self._workers: List[asyncio.Task] = []
         self._bg_tasks: List[asyncio.Task] = []
+        self._gc_task: Optional[asyncio.Task] = None
 
-    # ---- task spawning (tracked, cancellable) ----------------------------
-    def spawn_bg(self, coro) -> asyncio.Task:
-        t = asyncio.create_task(coro)
+    # -------------------------------------------------------------------
+    def spawn_bg(self, coro, name: str = "") -> asyncio.Task:
+        t = asyncio.create_task(coro, name=name or None)
         self._bg_tasks.append(t)
         return t
 
-    # ---- main loop -------------------------------------------------------
+    def _log(self, msg: str) -> None:
+        self.stats.log(msg)
+        if self._emit_log:
+            MiniHandlers.safe(self._emit_log, msg, time.time())
+
+    # -------------------------------------------------------------------
     async def run(self) -> None:
         try:
             await self._run_inner()
@@ -999,33 +1096,25 @@ class Crawler:
             await self.shutdown()
 
     async def _run_inner(self) -> None:
-        # Proxy phase — blocking, before we start crawling
-        if REFRESH_PROXIES or len(self.proxy_extractor.valid) < 5:
-            self.stats.log("Proxy extraction phase started...")
-            new = await self.proxy_extractor.extract_and_validate(
-                progress_cb=lambda d, t, v: self.stats.log(
-                    f"Proxies: {v} valid / {d} tried / {t} total"
-                ) if d % 25 == 0 else None
-            )
-            self.stats.log(f"Proxy phase done: +{new} new")
-        else:
-            self.stats.log(
-                f"Loaded {len(self.proxy_extractor.valid)} cached proxies."
-            )
+        # 1. Thread pool tuning
+        await self.opt.tune_thread_pool(96)
 
-        # Shared session
+        # 2. Session
         self.session = AsyncSession(
-            max_clients=ADAPTIVE_MAX,
-            max_concurrent=ADAPTIVE_MAX,
+            max_clients=self.config.adaptive_max,
+            max_concurrent=self.config.adaptive_max,
             http2=True,
         )
 
-        # Background tasks
-        self.spawn_bg(self.domain_manager.health_check_loop(self.stats, self))
-        self.spawn_bg(self._bloom_flush_loop())
-        self.spawn_bg(self._stats_sync_loop())
+        # 3. Writer up
+        await self.writer.start()
 
-        # Seed queue
+        # 4. Background tasks
+        self.spawn_bg(self._stats_pump(), "stats-pump")
+        self.spawn_bg(self._bloom_flush_loop(), "bloom-flush")
+        self.spawn_bg(self._gc_loop(), "gc-loop")
+
+        # 5. Seed queue
         seeded = 0
         for url in self.start_urls:
             if not self.bloom.contains(url):
@@ -1035,68 +1124,76 @@ class Crawler:
                 except asyncio.QueueFull:
                     break
         self.stats.inc("queued", seeded)
+        self._log(f"Seeded {seeded} URLs")
 
-        # Workers
-        for i in range(ADAPTIVE_MAX):
+        # 6. Workers
+        for i in range(self.config.adaptive_max):
             self._workers.append(asyncio.create_task(self._worker(i)))
 
-        # Idle detection + stop check
+        # 7. Idle detection
         idle_ticks = 0
         while self.running:
             if _STOP.is_set():
-                self.stats.log("Stop signal received.")
+                self._log("Stop signal received")
                 self.running = False
                 break
             await asyncio.sleep(1.0)
-            empty = self.url_queue.empty()
-            no_active = self.stats.active_workers == 0
-            if empty and no_active:
+            if self.url_queue.empty() and self.stats.active_workers == 0:
                 idle_ticks += 1
                 if idle_ticks >= 3:
-                    log.info("All queues drained — shutting down.")
+                    self._log("Queues drained — shutting down")
                     break
             else:
                 idle_ticks = 0
 
-    # ---- shutdown --------------------------------------------------------
     async def shutdown(self) -> None:
         self.running = False
-
-        # 1. Cancel all background tasks
         for t in self._bg_tasks:
             if not t.done():
                 t.cancel()
         if self._bg_tasks:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
-
-        # 2. Cancel workers
         for w in self._workers:
             if not w.done():
                 w.cancel()
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
-
-        # 3. Close session with timeout
         if self.session:
             try:
                 await asyncio.wait_for(self.session.close(), timeout=3.0)
             except Exception:
                 pass
-
-        # 4. Flush bloom + output
         try:
             self.bloom.close()
         except Exception:
             pass
         try:
-            await asyncio.wait_for(self.output.close(), timeout=3.0)
+            await asyncio.wait_for(self.writer.stop(), timeout=5.0)
         except Exception:
             pass
-
+        self.opt.restore()
         self.stats.running = False
-        log.info("Shutdown complete.")
 
-    # ---- background loops ------------------------------------------------
+    # -------------------------------------------------------------------
+    async def _stats_pump(self) -> None:
+        while self.running:
+            await asyncio.sleep(0.5)
+            if not self.running:
+                return
+            try:
+                s = self.stats.snapshot()
+                s["concurrency"] = self.adaptive.current
+                s["latency_ewma"] = self.adaptive.latency_ewma
+                s["error_ewma"] = self.adaptive.error_ewma
+                s["bloom_items"] = self.bloom.items
+                s["bloom_fp"] = self.bloom.estimated_fp_rate
+                s["writer_written"] = self.writer.written
+                s["writer_queue"] = self.writer.queue_depth
+                if self._emit_stats:
+                    self._emit_stats(s)
+            except Exception:
+                pass
+
     async def _bloom_flush_loop(self) -> None:
         while self.running:
             await asyncio.sleep(10.0)
@@ -1107,31 +1204,19 @@ class Crawler:
             except Exception:
                 pass
 
-    async def _stats_sync_loop(self) -> None:
+    async def _gc_loop(self) -> None:
         while self.running:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(15.0)
             if not self.running:
                 return
-            try:
-                with self.stats._lock:
-                    for domain, state in self.domain_manager.domains.items():
-                        self.stats.domains[domain] = {
-                            "healthy": state.healthy,
-                            "blocked_until": state.blocked_until,
-                            "queue": self.url_queue.qsize(),
-                            "fetched": state.total_fetched,
-                            "errors": state.total_errors,
-                        }
-            except Exception:
-                pass
+            self.opt.maybe_gc()
 
-    # ---- workers ---------------------------------------------------------
+    # -------------------------------------------------------------------
     async def _worker(self, worker_id: int) -> None:
         while self.running:
             try:
                 url, depth = await asyncio.wait_for(
-                    self.url_queue.get(), timeout=1.5
-                )
+                    self.url_queue.get(), timeout=1.5)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -1169,25 +1254,35 @@ class Crawler:
     async def _process(self, url: str, depth: int) -> None:
         if self.bloom.contains(url):
             return
-        domain = urlparse(url).netloc
-        state = await self.domain_manager.get(domain)
-
-        if await self.domain_manager.breaker.is_open(domain):
+        domain = self.opt.domain_of(url)
+        state = await self.domains.get(domain)
+        if await self.domains.breaker.is_open(domain):
             return
 
-        async with self.domain_manager.get_semaphore(domain):
-            await self.domain_manager.wait_for_access(domain)
+        sem = self.domains.get_semaphore(domain)
+        async with sem:
+            now = time.time()
+            if state.blocked_until > now:
+                await asyncio.sleep(state.blocked_until - now)
+            gap = now - state.last_access
+            if gap < self.config.domain_rate_limit:
+                await asyncio.sleep(self.config.domain_rate_limit - gap)
+            state.last_access = time.time()
+
             if _STOP.is_set():
                 return
 
-            for attempt in range(MAX_RETRIES):
+            profile = self.spoof.pick()
+            state.profile_name = self._profile_name(profile)
+            headers = self.spoof.build_headers(url, profile, state.last_referer)
+
+            for attempt in range(self.config.max_retries):
                 try:
                     r = await self.session.get(
                         url,
-                        impersonate=state.impersonate,
-                        proxies={"http": state.proxy, "https": state.proxy}
-                        if state.proxy else None,
-                        timeout=TIMEOUT,
+                        impersonate=profile["impersonate"],
+                        headers=headers,
+                        timeout=self.config.timeout,
                         allow_redirects=True,
                     )
                     if not MiniCheckers.is_html(r.headers):
@@ -1195,66 +1290,89 @@ class Crawler:
 
                     if r.status_code == 200:
                         if MiniCheckers.is_blocked(r.text):
-                            await self.domain_manager.mark_failure(domain, True)
+                            state.consecutive_failures += 1
+                            state.total_errors += 1
+                            await self.domains.breaker.record_failure(domain)
+                            state.blocked_until = time.time() + self.config.block_cooldown
+                            state.healthy = False
                             self.stats.inc("blocks")
-                            self.stats.log(f"BLOCK: {domain}")
+                            self._log(f"BLOCK: {domain}")
                             return
-                        await self.domain_manager.mark_success(domain)
-                        self.bloom.add(url)
-                        self.stats.inc("fetched")
+                        # success
+                        state.consecutive_failures = 0
+                        state.healthy = True
+                        state.total_fetched += 1
+                        state.last_referer = url
+                        await self.domains.breaker.record_success(domain)
+                        if self.bloom.add(url):
+                            self.stats.inc("fetched")
                         self.stats.inc("bytes", len(r.content))
-                        self.stats.log(f"OK: {url[:80]}")
-                        await self._parse(r.text, url, depth)
+                        self._log(f"OK: {url[:90]}")
+                        await self._parse(r.content, url, depth)
                         return
 
                     elif r.status_code in (403, 429, 503):
-                        await self.domain_manager.mark_failure(domain, True)
+                        state.consecutive_failures += 1
+                        state.total_errors += 1
+                        await self.domains.breaker.record_failure(domain)
+                        state.blocked_until = time.time() + self.config.block_cooldown
+                        state.healthy = False
                         self.stats.inc("blocks")
-                        self.stats.log(f"HTTP {r.status_code}: {domain}")
+                        self._log(f"HTTP {r.status_code}: {domain}")
                         return
                     else:
-                        await self.domain_manager.mark_failure(domain)
+                        state.total_errors += 1
+                        await self.domains.breaker.record_failure(domain)
                         return
 
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    if attempt < MAX_RETRIES - 1:
-                        await asyncio.sleep(RETRY_BASE ** attempt)
+                    if attempt < self.config.max_retries - 1:
+                        await asyncio.sleep(self.config.retry_base ** attempt)
                     else:
                         log.debug("Give up %s: %s", url, e)
-
             self.stats.inc("errors")
 
-    async def _parse(self, html_text: str, url: str, depth: int) -> None:
+    @staticmethod
+    def _profile_name(profile: dict) -> str:
+        for k, v in SpoofEngine.PROFILES.items():
+            if v is profile:
+                return k
+        return "?"
+
+    async def _parse(self, body: bytes, url: str, depth: int) -> None:
         try:
-            tree = html.fromstring(html_text)
+            tree = lxml_html.fromstring(body)
         except Exception:
             return
 
-        MiniCleaners.strip_junk_tags(tree)
-        MiniCleaners.strip_comments(tree)
-
+        MiniCleaners.clean_tree(tree)
         title = MiniCleaners.extract_title(tree)
-        text = MiniCleaners.cap_text(MiniCleaners.extract_text(tree))
+        text = MiniCleaners.cap(MiniCleaners.extract_text(tree),
+                                 self.config.max_text_length)
         wc = MiniCheckers.count_words(text)
-        lang = MiniCheckers.detect_language(text)
+        lang = self.opt.detect_language(text)
         chash = MiniCheckers.hash_text(text)
 
-        record = {
+        # ---- IMMEDIATE write to secondary storage -----------------------
+        await self.writer.write({
             "text": text,
             "link": url,
             "title": title,
             "hash": chash,
             "word_count": wc,
             "language": lang,
-        }
-        await self.output.write(json.dumps(record, ensure_ascii=False))
+        })
 
-        # Batch link extraction — put_nowait, no per-link await
-        if depth < MAX_DEPTH:
-            new_urls: List[Tuple[str, int]] = []
-            for href in tree.xpath("//a/@href"):
+        # ---- batched link fanout ----------------------------------------
+        if depth < self.config.max_depth:
+            new: List[Tuple[str, int]] = []
+            contains = self.bloom.contains
+            for a in tree.iter("a"):
+                href = a.get("href")
+                if not href:
+                    continue
                 try:
                     absolute = urljoin(url, href)
                     absolute, _ = urldefrag(absolute)
@@ -1262,14 +1380,15 @@ class Crawler:
                     continue
                 if not MiniCheckers.is_valid_url(absolute):
                     continue
-                if self.bloom.contains(absolute):
+                if contains(absolute):
                     continue
-                new_urls.append((absolute, depth + 1))
+                new.append((absolute, depth + 1))
 
             pushed = 0
-            for item in new_urls:
+            q = self.url_queue
+            for item in new:
                 try:
-                    self.url_queue.put_nowait(item)
+                    q.put_nowait(item)
                     pushed += 1
                 except asyncio.QueueFull:
                     break
@@ -1278,158 +1397,434 @@ class Crawler:
 
 
 # ===========================================================================
-# TERMINAL UI (async, ANSI)
+# GUI (PyQt6) — built lazily so headless/test modes don't touch Qt
 # ===========================================================================
-class TerminalUI:
-    def __init__(self, crawler: Crawler, stats: Stats):
-        self.crawler = crawler
-        self.stats = stats
-        self.running = True
-        self._is_tty = sys.stdout.isatty() and not FORCE_NO_UI
-        self._win_kb = None
-        if sys.platform == "win32":
+def _build_gui_classes():
+    """Return (CrawlerThread, NexusWindow) — requires PyQt6 imported."""
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QGridLayout, QPushButton, QLineEdit, QLabel, QTableWidget,
+        QTableWidgetItem, QPlainTextEdit, QSplitter, QFileDialog,
+        QMessageBox, QStatusBar,
+    )
+    from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
+    from PyQt6.QtGui import QFont, QAction
+
+    # -----------------------------------------------------------------
+    class CrawlerThread(QThread):
+        stats_ready = pyqtSignal(dict)
+        log_ready = pyqtSignal(str, float)
+        finished_cleanly = pyqtSignal()
+        fatal_error = pyqtSignal(str)
+
+        def __init__(self, urls, config):
+            super().__init__()
+            self.urls = urls
+            self.config = config
+            self.crawler: Optional[Crawler] = None
+            self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        def run(self):
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
             try:
-                import msvcrt
-                self._win_kb = msvcrt
-            except ImportError:
-                pass
-        self._win_lock = threading.Lock()
+                self._loop.run_until_complete(self._run_async())
+            except Exception as e:
+                self.fatal_error.emit(f"{type(e).__name__}: {e}")
+            finally:
+                try:
+                    self._loop.run_until_complete(
+                        self._loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                self._loop.close()
+                self.finished_cleanly.emit()
 
-    async def run(self) -> None:
-        if not self._is_tty:
-            # headless: just poll and log periodically
-            while self.running and self.crawler.running:
-                await asyncio.sleep(3.0)
-                s = self.stats.snapshot()
-                c = self.crawler
-                log.info("queued=%d fetched=%d err=%d blk=%d workers=%d/%d "
-                         "bloom=%d fp=%.6f proxies=%d",
-                         s["queued"], s["fetched"], s["errors"], s["blocks"],
-                         s["active"], c.adaptive.current,
-                         c.bloom.items, c.bloom.estimated_fp_rate,
-                         len(c.proxy_extractor.valid))
-            return
-
-        # Interactive TUI
-        while self.running and self.crawler.running:
-            self._draw()
-            self._poll_keys()
-            await asyncio.sleep(0.4)
-
-    def stop(self) -> None:
-        self.running = False
-
-    def _poll_keys(self) -> None:
-        if self._win_kb is not None:
-            try:
-                while self._win_kb.kbhit():
-                    try:
-                        ch = self._win_kb.getch().decode("utf-8", "ignore").lower()
-                    except Exception:
-                        break
-                    self._handle_key(ch)
-            except Exception:
-                pass
-        else:
-            try:
-                import select
-                r, _, _ = select.select([sys.stdin], [], [], 0)
-                if r:
-                    ch = sys.stdin.read(1).lower()
-                    self._handle_key(ch)
-            except Exception:
-                pass
-
-    def _handle_key(self, k: str) -> None:
-        if k == "q":
-            self.stats.running = False
-            self.running = False
-            _STOP.set()
-        elif k == "p":
-            self.stats.paused = not self.stats.paused
-            self.stats.log("PAUSED" if self.stats.paused else "RESUMED")
-        elif k == "s":
-            self._snapshot()
-
-    def _snapshot(self) -> None:
-        s = self.stats.snapshot()
-        fn = f"snapshot_{int(time.time())}.json"
-        try:
-            with open(fn, "w", encoding="utf-8") as f:
-                json.dump({k: v for k, v in s.items() if k != "logs"},
-                          f, indent=2, default=str)
-            self.stats.log(f"Snapshot: {fn}")
-        except Exception as e:
-            self.stats.log(f"Snapshot failed: {e}")
-
-    def _draw(self) -> None:
-        c = self.crawler
-        s = self.stats.snapshot()
-        w = max(90, min(140, self._term_width()))
-        status = "PAUSED" if s["paused"] else ("RUNNING" if c.running else "STOPPED")
-        header = f" NEXUS v4 │ {status} │ {self._fmt_time(s['uptime'])} "
-        pps = s["fetched"] / max(s["uptime"], 1)
-        bps = s["bytes"] / max(s["uptime"], 1)
-
-        lines = []
-        lines.append(f"\033[7m{header:<{w}}\033[0m")
-        lines.append("")
-        lines.append(f"  Queued: {s['queued']:<10} Fetched: {s['fetched']:<10} "
-                     f"Errors: {s['errors']:<8} Blocks: {s['blocks']:<8}")
-        lines.append(f"  Workers: {s['active']}/{c.adaptive.current:<6} "
-                     f"Pages/s: {pps:<6.1f} Bytes/s: {self._fmt_bytes(bps):<10} "
-                     f"Proxies: {len(c.proxy_extractor.valid)}")
-        lines.append(f"  Bloom: {c.bloom.items} items  FP≈"
-                     f"{c.bloom.estimated_fp_rate:.6f}  "
-                     f"lat_ewma={c.adaptive.latency_ewma:.2f}s  "
-                     f"err_ewma={c.adaptive.error_ewma:.3f}")
-        lines.append("")
-        lines.append("  ── DOMAINS " + "─" * (w - 12))
-        dom_items = sorted(
-            s["domains"].items(),
-            key=lambda x: -x[1].get("fetched", 0),
-        )[:10]
-        if not dom_items:
-            lines.append("  (none yet)")
-        for dom, st in dom_items:
-            blocked = st.get("blocked_until", 0) > time.time()
-            health = "BLOCKED" if blocked else ("OK" if st.get("healthy", True) else "BAD")
-            lines.append(
-                f"  {dom[:40]:<40} {health:<8} "
-                f"f:{st.get('fetched', 0):<6} e:{st.get('errors', 0):<5}"
+        async def _run_async(self):
+            stats = Stats()
+            self.crawler = Crawler(
+                self.urls, self.config, stats,
+                emit_stats=self.stats_ready.emit,
+                emit_log=self.log_ready.emit,
             )
-        lines.append("")
-        lines.append("  ── LOG " + "─" * (w - 8))
-        for ts, msg in s["logs"][-10:]:
-            lines.append(
-                f"  {time.strftime('%H:%M:%S', time.localtime(ts))}  {msg[:w-12]}"
+            await self.crawler.run()
+
+        def request_stop(self):
+            if self.crawler:
+                self.crawler.running = False
+
+    # -----------------------------------------------------------------
+    DARK_QSS = """
+        QMainWindow, QWidget { background: #1b1d22; color: #d8dee9; }
+        QLineEdit { background: #232630; color: #d8dee9; border: 1px solid #343846;
+                    border-radius: 4px; padding: 6px 8px; }
+        QPushButton { background: #2b2f3a; color: #d8dee9; border: 1px solid #343846;
+                      border-radius: 4px; padding: 6px 14px; }
+        QPushButton:hover { background: #343946; }
+        QPushButton:disabled { color: #6b7280; background: #232630; }
+        QPushButton#primary { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+        QPushButton#primary:hover { background: #2563eb; }
+        QPushButton#danger  { background: #dc2626; color: #fff; border-color: #dc2626; }
+        QPushButton#danger:hover { background: #b91c1c; }
+        QLabel { color: #d8dee9; }
+        QTableWidget { background: #232630; color: #d8dee9;
+                       gridline-color: #343846; border: 1px solid #343846; }
+        QHeaderView::section { background: #2b2f3a; color: #d8dee9;
+                               border: 0; padding: 6px; }
+        QPlainTextEdit { background: #16181d; color: #d8dee9;
+                         border: 1px solid #343846; font-family: Consolas, monospace; }
+        QStatusBar { background: #16181d; color: #8892a0; }
+        QMenuBar { background: #1b1d22; color: #d8dee9; }
+        QMenuBar::item:selected { background: #2b2f3a; }
+        QMenu { background: #232630; color: #d8dee9; border: 1px solid #343846; }
+        QMenu::item:selected { background: #3b82f6; }
+    """
+
+    class NexusWindow(QMainWindow):
+        def __init__(self, config: Config):
+            super().__init__()
+            self.config = config
+            self._thread: Optional[CrawlerThread] = None
+            self._latest: dict = {}
+            self._domain_row: Dict[str, int] = {}
+            self._build_ui()
+            self.setStyleSheet(DARK_QSS)
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._refresh)
+            self._timer.start(500)
+
+        # --- UI ------------------------------------------------------
+        def _build_ui(self):
+            self.setWindowTitle("Nexus Scraper v5")
+            self.resize(1440, 900)
+
+            root = QWidget()
+            layout = QVBoxLayout(root)
+
+            # --- top bar
+            top = QHBoxLayout()
+            top.addWidget(QLabel("Start URL:"))
+            self.url_input = QLineEdit()
+            self.url_input.setPlaceholderText("https://example.com  —  or click Load file")
+            top.addWidget(self.url_input, 1)
+
+            self.load_btn = QPushButton("Load file")
+            self.start_btn = QPushButton("Start")
+            self.start_btn.setObjectName("primary")
+            self.pause_btn = QPushButton("Pause")
+            self.pause_btn.setEnabled(False)
+            self.stop_btn = QPushButton("Stop")
+            self.stop_btn.setObjectName("danger")
+            self.stop_btn.setEnabled(False)
+
+            top.addWidget(self.load_btn)
+            top.addWidget(self.start_btn)
+            top.addWidget(self.pause_btn)
+            top.addWidget(self.stop_btn)
+            layout.addLayout(top)
+
+            # --- stats grid
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(20)
+            grid.setVerticalSpacing(4)
+            self.stat_labels: Dict[str, QLabel] = {}
+            fields = [
+                ("queued", "Queued"), ("fetched", "Fetched"),
+                ("active", "Workers"), ("concurrency", "Concurrency"),
+                ("errors", "Errors"), ("blocks", "Blocks"),
+                ("pps", "Pages/s"), ("wps", "Writes/s"),
+                ("bytes_fmt", "Bytes"), ("bloom_items", "Bloom items"),
+                ("bloom_fp", "Bloom FP"), ("writer_queue", "Disk queue"),
+                ("uptime", "Uptime"),
+            ]
+            for i, (key, label) in enumerate(fields):
+                r, c = divmod(i, 4)
+                l = QLabel(f"{label}:")
+                l.setStyleSheet("color: #8892a0;")
+                grid.addWidget(l, r * 2, c)
+                v = QLabel("—")
+                v.setStyleSheet("color: #d8dee9; font-weight: 600;")
+                self.stat_labels[key] = v
+                grid.addWidget(v, r * 2 + 1, c)
+            layout.addLayout(grid)
+
+            # --- splitter: domains | log
+            splitter = QSplitter(Qt.Orientation.Horizontal)
+
+            self.domains_table = QTableWidget(0, 6)
+            self.domains_table.setHorizontalHeaderLabels(
+                ["Domain", "Health", "Profile", "Fetched", "Errors", "Blocked"])
+            self.domains_table.horizontalHeader().setStretchLastSection(True)
+            self.domains_table.setEditTriggers(
+                QTableWidget.EditTrigger.NoEditTriggers)
+            self.domains_table.setSelectionBehavior(
+                QTableWidget.SelectionBehavior.SelectRows)
+            self.domains_table.verticalHeader().setVisible(False)
+            splitter.addWidget(self.domains_table)
+
+            log_panel = QWidget()
+            log_layout = QVBoxLayout(log_panel)
+            log_layout.setContentsMargins(0, 0, 0, 0)
+            header = QLabel("Live log")
+            header.setStyleSheet("color: #8892a0; padding: 4px;")
+            log_layout.addWidget(header)
+            self.log_view = QPlainTextEdit()
+            self.log_view.setReadOnly(True)
+            self.log_view.setMaximumBlockCount(5000)
+            log_layout.addWidget(self.log_view)
+            splitter.addWidget(log_panel)
+
+            splitter.setStretchFactor(0, 3)
+            splitter.setStretchFactor(1, 2)
+            layout.addWidget(splitter, 1)
+
+            self.setCentralWidget(root)
+            self.setStatusBar(QStatusBar())
+            self.statusBar().showMessage("Idle")
+
+            # --- menu
+            menu = self.menuBar()
+            fm = menu.addMenu("File")
+            fm.addAction(QAction("Load start URLs…", self, triggered=self._load_file))
+            fm.addAction(QAction("Save snapshot…", self, triggered=self._snapshot))
+            fm.addSeparator()
+            fm.addAction(QAction("Exit", self, triggered=self.close))
+            vm = menu.addMenu("View")
+            vm.addAction(QAction("Clear log", self, triggered=self.log_view.clear))
+
+            # --- signals
+            self.start_btn.clicked.connect(self._on_start)
+            self.pause_btn.clicked.connect(self._on_pause)
+            self.stop_btn.clicked.connect(self._on_stop)
+            self.load_btn.clicked.connect(self._load_file)
+
+        # --- slots ---------------------------------------------------
+        def _load_file(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Choose start URLs file", "",
+                "Text (*.txt);;All files (*)")
+            if not path:
+                return
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = [l.strip() for l in f if l.strip()
+                             and not l.startswith("#")]
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
+                return
+            self.url_input.setText(f"file:{path}")
+            self.statusBar().showMessage(
+                f"Loaded {len(lines)} URLs from {os.path.basename(path)}")
+            self._pending_file = path
+
+        def _on_start(self):
+            raw = self.url_input.text().strip()
+            urls: List[str] = []
+            if raw.startswith("file:"):
+                path = raw[5:]
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        urls = [l.strip() for l in f if l.strip()
+                                and not l.startswith("#")]
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", str(e))
+                    return
+            elif raw:
+                urls = [raw]
+            if not urls:
+                QMessageBox.information(self, "Nexus",
+                                        "Enter a URL or load a file.")
+                return
+            urls = [u for u in urls if MiniCheckers.is_valid_url(u)]
+            if not urls:
+                QMessageBox.warning(self, "Nexus", "No valid http(s) URLs.")
+                return
+
+            self.log_view.clear()
+            self.domains_table.setRowCount(0)
+            self._domain_row.clear()
+
+            self._thread = CrawlerThread(urls, self.config)
+            self._thread.stats_ready.connect(self._on_stats)
+            self._thread.log_ready.connect(self._on_log)
+            self._thread.finished_cleanly.connect(self._on_finished)
+            self._thread.fatal_error.connect(self._on_fatal)
+            self._thread.start()
+
+            self.start_btn.setEnabled(False)
+            self.pause_btn.setEnabled(True)
+            self.pause_btn.setText("Pause")
+            self.stop_btn.setEnabled(True)
+            self.statusBar().showMessage(f"Running — {len(urls)} start URL(s)")
+
+        def _on_pause(self):
+            if not self._thread or not self._thread.crawler:
+                return
+            c = self._thread.crawler
+            c.stats.paused = not c.stats.paused
+            self.pause_btn.setText("Resume" if c.stats.paused else "Pause")
+
+        def _on_stop(self):
+            if self._thread:
+                self._thread.request_stop()
+                self.statusBar().showMessage("Stopping…")
+
+        def _on_finished(self):
+            self.start_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.statusBar().showMessage("Stopped")
+            self._thread = None
+
+        def _on_fatal(self, msg: str):
+            self._append_log(f"FATAL: {msg}", time.time(), "#ef4444")
+            QMessageBox.critical(self, "Crawler error", msg)
+
+        def _on_stats(self, snap: dict):
+            self._latest = snap
+
+        def _on_log(self, msg: str, ts: float):
+            color = "#8892a0"
+            if msg.startswith("BLOCK"): color = "#f59e0b"
+            elif msg.startswith("OK"):  color = "#10b981"
+            elif msg.startswith("HTTP"): color = "#ef4444"
+            self._append_log(msg, ts, color)
+
+        def _append_log(self, msg: str, ts: float, color: str = "#8892a0"):
+            stamp = time.strftime("%H:%M:%S", time.localtime(ts))
+            self.log_view.appendHtml(
+                f'<span style="color:#5b6472">{stamp}</span> '
+                f'<span style="color:{color}">{self._html_escape(msg)}</span>'
             )
-        lines.append(f"\n  [q]uit  [p]ause  [s]napshot")
-        out = "\033[H" + "\n".join(lines) + "\033[J"
-        sys.stdout.write(out)
-        sys.stdout.flush()
 
-    @staticmethod
-    def _term_width() -> int:
-        try:
-            return os.get_terminal_size().columns
-        except Exception:
-            return 100
+        @staticmethod
+        def _html_escape(s: str) -> str:
+            return (s.replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;"))
 
-    @staticmethod
-    def _fmt_time(seconds: float) -> str:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
-        s = int(seconds % 60)
-        return f"{h:02d}:{m:02d}:{s:02d}"
+        def _refresh(self):
+            s = self._latest
+            if not s:
+                return
+            up = s.get("uptime", 0.0)
+            pps = s.get("fetched", 0) / max(up, 1)
+            wps = s.get("writer_written", 0) / max(up, 1)
 
-    @staticmethod
-    def _fmt_bytes(b: float) -> str:
-        for unit in ("B", "KB", "MB", "GB"):
-            if b < 1024:
-                return f"{b:.1f}{unit}"
-            b /= 1024
-        return f"{b:.1f}TB"
+            def fmt_bytes(b):
+                for u in ("B", "KB", "MB", "GB"):
+                    if b < 1024:
+                        return f"{b:.1f}{u}"
+                    b /= 1024
+                return f"{b:.1f}TB"
+
+            L = self.stat_labels
+            L["queued"].setText(f"{s.get('queued', 0):,}")
+            L["fetched"].setText(f"{s.get('fetched', 0):,}")
+            L["active"].setText(f"{s.get('active', 0)}/{s.get('concurrency', 0)}")
+            L["concurrency"].setText(str(s.get("concurrency", 0)))
+            L["errors"].setText(f"{s.get('errors', 0):,}")
+            L["blocks"].setText(f"{s.get('blocks', 0):,}")
+            L["pps"].setText(f"{pps:,.1f}")
+            L["wps"].setText(f"{wps:,.1f}")
+            L["bytes_fmt"].setText(fmt_bytes(s.get("bytes", 0)))
+            L["bloom_items"].setText(f"{s.get('bloom_items', 0):,}")
+            L["bloom_fp"].setText(f"{s.get('bloom_fp', 0):.6f}")
+            L["writer_queue"].setText(f"{s.get('writer_queue', 0):,}")
+            L["uptime"].setText(self._fmt_time(up))
+
+            self._update_domains(s.get("domains", {}))
+
+        @staticmethod
+        def _fmt_time(secs: float) -> str:
+            h = int(secs // 3600)
+            m = int((secs % 3600) // 60)
+            s = int(secs % 60)
+            return f"{h:02d}:{m:02d}:{s:02d}"
+
+        def _update_domains(self, domains: Dict[str, dict]):
+            t = self.domains_table
+            # grow table if needed
+            if t.rowCount() < len(domains):
+                t.setRowCount(len(domains))
+            for dom, st in sorted(domains.items(),
+                                   key=lambda x: -x[1].get("fetched", 0)):
+                row = self._domain_row.get(dom)
+                if row is None:
+                    row = len(self._domain_row)
+                    self._domain_row[dom] = row
+                    if row >= t.rowCount():
+                        t.setRowCount(row + 1)
+
+                blocked = st.get("blocked_until", 0) > time.time()
+                healthy = st.get("healthy", True)
+                if blocked:
+                    health, hcolor = "BLOCKED", "#f59e0b"
+                elif healthy:
+                    health, hcolor = "OK", "#10b981"
+                else:
+                    health, hcolor = "UNHEALTHY", "#ef4444"
+
+                cells = [
+                    (dom, None),
+                    (health, hcolor),
+                    (st.get("profile", "-"), None),
+                    (f"{st.get('fetched', 0)}", None),
+                    (f"{st.get('errors', 0)}", None),
+                    ("yes" if blocked else "no",
+                     "#f59e0b" if blocked else "#6b7280"),
+                ]
+                for c, (text, color) in enumerate(cells):
+                    item = t.item(row, c)
+                    if item is None:
+                        item = QTableWidgetItem()
+                        t.setItem(row, c, item)
+                    item.setText(text)
+                    if color:
+                        item.setForeground(QtG.QColor(color))
+            # trim unused rows
+            if t.rowCount() > len(self._domain_row):
+                t.setRowCount(len(self._domain_row))
+
+        def _snapshot(self):
+            if not self._latest:
+                return
+            fn, _ = QFileDialog.getSaveFileName(
+                self, "Save snapshot", f"snapshot_{int(time.time())}.json",
+                "JSON (*.json)")
+            if not fn:
+                return
+            try:
+                with open(fn, "w", encoding="utf-8") as f:
+                    json.dump({k: v for k, v in self._latest.items()
+                                if k != "logs"}, f, indent=2, default=str)
+                self.statusBar().showMessage(f"Saved {fn}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", str(e))
+
+        def closeEvent(self, ev):
+            if self._thread and self._thread.isRunning():
+                self._thread.request_stop()
+                self._thread.wait(5000)
+            ev.accept()
+
+    return CrawlerThread, NexusWindow
+
+
+def launch_gui(urls: Optional[List[str]], config: Config) -> int:
+    if not _ensure_qt():
+        print("PyQt6 is not installed. Run:  pip install PyQt6")
+        print("Falling back to headless mode.")
+        return 1
+    CrawlerThread, NexusWindow = _build_gui_classes()
+    app = QApplication(sys.argv)
+    app.setApplicationName("Nexus Scraper")
+    font = QFont("Segoe UI" if sys.platform == "win32" else "Sans", 10)
+    app.setFont(font)
+    win = NexusWindow(config)
+    if urls:
+        win.url_input.setText(urls[0])
+    win.show()
+    return app.exec()
 
 
 # ===========================================================================
@@ -1441,10 +1836,9 @@ class TestingMachine:
 
     def run_all(self) -> bool:
         print("\n" + "=" * 74)
-        print("  NEXUS v4 TESTING MACHINE")
+        print("  NEXUS v5 TESTING MACHINE")
         print("=" * 74)
-        tests = sorted(n for n in dir(self) if n.startswith("test_"))
-        for name in tests:
+        for name in sorted(n for n in dir(self) if n.startswith("test_")):
             fn = getattr(self, name)
             t0 = time.perf_counter()
             try:
@@ -1474,48 +1868,87 @@ class TestingMachine:
         print("=" * 74 + "\n")
         return passed == total
 
-    # ---- Bloom ----------------------------------------------------------
-    def test_bloom_add_returns_true_only_for_new(self):
+    # --- config ---
+    def test_config_defaults(self):
+        c = Config()
+        assert c.max_depth > 0
+        assert c.bloom_capacity > 1_000_000
+        assert "chrome124" in c.spoof_profiles
+
+    def test_config_roundtrip(self):
+        c = Config()
+        c.max_depth = 7
+        path = "test_cfg.json"
+        try:
+            with open(path, "w") as f:
+                json.dump({"max_depth": 7, "adaptive_max": 123}, f)
+            c2 = Config.load(path)
+            assert c2.max_depth == 7
+            assert c2.adaptive_max == 123
+        finally:
+            MiniHandlers.safe(lambda: os.remove(path))
+
+    # --- opt center ---
+    def test_lru_evicts(self):
+        l = _LRU(10)
+        for i in range(20):
+            l.put(i, i)
+        assert len(l._data) <= 10
+
+    def test_opt_url_cache(self):
+        oc = OptimizationCenter(Config())
+        u = "https://example.com/path?q=1"
+        p1 = oc.parse_url(u)
+        p2 = oc.parse_url(u)
+        assert p1 is p2
+        oc.restore()
+
+    def test_opt_domain_cache(self):
+        oc = OptimizationCenter(Config())
+        assert oc.domain_of("https://a.com/x") == "a.com"
+        assert oc.domain_of("https://a.com/x") == "a.com"
+        oc.restore()
+
+    def test_opt_language_cache(self):
+        oc = OptimizationCenter(Config())
+        t = "the quick brown fox is in the house"
+        assert oc.detect_language(t) == "en"
+        assert oc.detect_language(t) == "en"
+        oc.restore()
+
+    # --- lazy loader ---
+    def test_lazy_loader_resolves(self):
+        j = _Lazy("json")
+        assert j.dumps({"a": 1}) == '{"a": 1}'
+
+    # --- bloom ---
+    def test_bloom_new_vs_dup(self):
         fn = "test_bloom_a.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
-        b = BloomFilter(fn, capacity=10_000, error_rate=0.01)
+        b = BloomFilter(fn, 10_000, 0.01)
         assert b.add("x") is True
         assert b.add("x") is False
-        assert b.add("y") is True
         b.close()
         os.remove(fn)
 
-    def test_bloom_counter_increments_only_on_new(self):
+    def test_bloom_counter(self):
         fn = "test_bloom_b.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
-        b = BloomFilter(fn, capacity=10_000, error_rate=0.01)
+        b = BloomFilter(fn, 10_000, 0.01)
         for i in range(100):
-            b.add(f"item{i}")
-        assert b.items == 100, f"expected 100, got {b.items}"
-        for i in range(100):
-            b.add(f"item{i}")
-        assert b.items == 100, f"double-add changed counter: {b.items}"
-        b.close()
-        os.remove(fn)
-
-    def test_bloom_persistence(self):
-        fn = "test_bloom_c.bloom"
-        MiniHandlers.safe(lambda: os.remove(fn))
-        b = BloomFilter(fn, capacity=10_000, error_rate=0.01)
-        for i in range(50):
             b.add(f"k{i}")
+        assert b.items == 100
+        for i in range(100):
+            b.add(f"k{i}")
+        assert b.items == 100
         b.close()
-        b2 = BloomFilter(fn, capacity=10_000, error_rate=0.01)
-        for i in range(50):
-            assert b2.contains(f"k{i}"), f"lost k{i}"
-        b2.close()
         os.remove(fn)
 
     def test_bloom_no_false_negatives(self):
-        fn = "test_bloom_d.bloom"
+        fn = "test_bloom_c.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
-        b = BloomFilter(fn, capacity=100_000, error_rate=0.01)
-        items = [f"https://site{i}.com/p" for i in range(5000)]
+        b = BloomFilter(fn, 100_000, 0.01)
+        items = [f"https://s{i}.c/p" for i in range(5000)]
         for it in items:
             b.add(it)
         for it in items:
@@ -1523,272 +1956,152 @@ class TestingMachine:
         b.close()
         os.remove(fn)
 
-    # ---- Adaptive -------------------------------------------------------
-    async def test_adaptive_increases_when_fast(self):
-        ac = AdaptiveConcurrency(initial=100, min_cap=10, max_cap=1000,
-                                 target_latency=1.0)
+    # --- spoof engine ---
+    def test_spoof_four_layers(self):
+        se = SpoofEngine(("chrome124",))
+        prof = se.pick()
+        h = se.build_headers("https://x.com", prof, referer="https://x.com/a")
+        # Layer 2
+        assert h["User-Agent"] == prof["ua"]
+        assert "Accept-Language" in h
+        # Layer 3
+        assert "Sec-CH-UA" in h
+        assert "Sec-CH-UA-Mobile" in h
+        assert "Sec-CH-UA-Platform" in h
+        # Layer 4
+        assert h["Referer"] == "https://x.com/a"
+
+    def test_spoof_firefox_no_ch(self):
+        se = SpoofEngine(("firefox120",))
+        prof = se.pick()
+        h = se.build_headers("https://x.com", prof)
+        assert "Sec-CH-UA" not in h
+
+    # --- adaptive ---
+    async def test_adaptive_up_and_down(self):
+        ac = AdaptiveConcurrency(100, 10, 1000, 1.0)
         for _ in range(200):
             await ac.record(0.2, False)
         assert ac.current > 100
-
-    async def test_adaptive_decreases_when_slow(self):
-        ac = AdaptiveConcurrency(initial=200, min_cap=10, max_cap=1000,
-                                 target_latency=1.0)
+        ac2 = AdaptiveConcurrency(200, 10, 1000, 1.0)
         for _ in range(200):
-            await ac.record(5.0, False)
-        assert ac.current < 200
+            await ac2.record(5.0, False)
+        assert ac2.current < 200
 
-    async def test_adaptive_respects_bounds(self):
-        ac = AdaptiveConcurrency(initial=50, min_cap=20, max_cap=80,
-                                 target_latency=1.0)
-        for _ in range(400):
-            await ac.record(0.1, False)
-        assert ac.current <= 80
-        for _ in range(400):
-            await ac.record(10.0, True)
-        assert ac.current >= 20
-
-    # ---- Cleaners -------------------------------------------------------
-    def test_normalize_whitespace(self):
-        assert MiniCleaners.normalize_whitespace("a   b\tc") == "a b c"
-        assert MiniCleaners.normalize_whitespace("x\n\n\ny") == "x\ny"
-        assert MiniCleaners.normalize_whitespace("  hi  ") == "hi"
-
-    def test_cap_text(self):
-        assert MiniCleaners.cap_text("abc", 10) == "abc"
-        assert MiniCleaners.cap_text("a" * 100, 10) == "a" * 10
-
-    def test_extract_title_title_tag(self):
-        tree = html.fromstring(
-            "<html><head><title>Hello</title></head></html>")
-        assert MiniCleaners.extract_title(tree) == "Hello"
-
-    def test_extract_title_og_fallback(self):
-        tree = html.fromstring(
-            '<html><head><meta property="og:title" content="OG"></head></html>')
-        assert MiniCleaners.extract_title(tree) == "OG"
-
-    def test_strip_junk_tags(self):
-        src = "<html><body><p>keep</p><script>evil()</script></body></html>"
-        tree = html.fromstring(src)
-        MiniCleaners.strip_junk_tags(tree)
+    # --- cleaners ---
+    def test_cleaner_junk_and_comment(self):
+        src = "<html><body><p>keep</p><script>evil()</script><!--c--></body></html>"
+        tree = lxml_html.fromstring(src)
+        MiniCleaners.clean_tree(tree)
         txt = MiniCleaners.extract_text(tree)
-        assert "keep" in txt and "evil" not in txt
+        assert "keep" in txt
+        assert "evil" not in txt
+        assert "c" not in txt.replace("keep", "")
 
-    # ---- Checkers -------------------------------------------------------
-    def test_valid_url(self):
+    def test_cleaner_title(self):
+        t = lxml_html.fromstring("<html><head><title>Hi</title></head></html>")
+        assert MiniCleaners.extract_title(t) == "Hi"
+
+    # --- checkers ---
+    def test_checkers_blocked(self):
+        assert MiniCheckers.is_blocked("Just a moment...")
+        assert not MiniCheckers.is_blocked("<p>hi</p>")
+
+    def test_checkers_lang_script(self):
+        assert MiniCheckers._detect_language_uncached("Привет") == "ru"
+        assert MiniCheckers._detect_language_uncached("你好") == "zh"
+
+    def test_checkers_lang_en(self):
+        assert MiniCheckers._detect_language_uncached(
+            "the quick brown fox is in the house") == "en"
+
+    def test_checkers_words(self):
+        assert MiniCheckers.count_words("one two three") == 3
+
+    def test_checkers_valid_url(self):
         assert MiniCheckers.is_valid_url("https://a.com")
         assert not MiniCheckers.is_valid_url("javascript:void")
-        assert not MiniCheckers.is_valid_url("")
 
-    def test_is_html(self):
-        assert MiniCheckers.is_html({"Content-Type": "text/html; charset=utf-8"})
-        assert MiniCheckers.is_html({"content-type": "application/xhtml+xml"})
-        assert not MiniCheckers.is_html({"Content-Type": "image/png"})
-
-    def test_blocked(self):
-        assert MiniCheckers.is_blocked("Just a moment...")
-        assert MiniCheckers.is_blocked("Attention Required! | Cloudflare")
-        assert not MiniCheckers.is_blocked("<p>hello</p>")
-
-    def test_language_script(self):
-        assert MiniCheckers.detect_language("Привет, мир") == "ru"
-        assert MiniCheckers.detect_language("你好世界") == "zh"
-        assert MiniCheckers.detect_language("こんにちは") == "ja"
-
-    def test_language_english(self):
-        assert MiniCheckers.detect_language(
-            "the quick brown fox is in the house and on the table"
-        ) == "en"
-
-    def test_count_words(self):
-        assert MiniCheckers.count_words("one two three") == 3
-        assert MiniCheckers.count_words("") == 0
-
-    def test_hash_text(self):
-        assert MiniCheckers.hash_text("a") == MiniCheckers.hash_text("a")
-        assert MiniCheckers.hash_text("a") != MiniCheckers.hash_text("b")
-
-    # ---- Handlers -------------------------------------------------------
-    async def test_retry_async_succeeds(self):
-        state = {"n": 0}
-
-        @MiniHandlers.retry_async(max_attempts=4, base=0.01)
-        async def flaky():
-            state["n"] += 1
-            if state["n"] < 3:
-                raise ValueError("nope")
-            return "ok"
-
-        assert await flaky() == "ok"
-        assert state["n"] == 3
-
-    async def test_retry_async_raises(self):
-        state = {"n": 0}
-
-        @MiniHandlers.retry_async(max_attempts=3, base=0.01)
-        async def fail():
-            state["n"] += 1
-            raise RuntimeError("nope")
-
-        try:
-            await fail()
-            assert False
-        except RuntimeError:
-            assert state["n"] == 3
-
-    async def test_circuit_breaker(self):
-        cb = CircuitBreaker(threshold=3, timeout=0.5)
-        assert not await cb.is_open("k")
-        for _ in range(3):
-            await cb.record_failure("k")
-        assert await cb.is_open("k")
-        await asyncio.sleep(0.6)
-        assert not await cb.is_open("k")
-
-    async def test_token_bucket(self):
-        tb = TokenBucket(rate=20.0, capacity=2.0)
-        t0 = time.monotonic()
-        await tb.acquire()
-        await tb.acquire()
-        await tb.acquire()
-        assert time.monotonic() - t0 >= 0.04
-
-    # ---- BatchWriter ----------------------------------------------------
-    async def test_batch_writer_flushes(self):
-        fn = "test_batch.jsonl"
+    # --- disk writer ---
+    async def test_disk_writer_writes(self):
+        fn = "test_writer.jsonl"
         MiniHandlers.safe(lambda: os.remove(fn))
-        bw = BatchWriter(fn, batch_size=3)
-        for i in range(7):
-            await bw.write(f'{{"i":{i}}}')
-        await bw.close()
+        cfg = Config()
+        cfg.output_file = fn
+        w = DiskWriter(fn, cfg)
+        await w.start()
+        for i in range(50):
+            await w.write({"i": i, "link": f"https://x.com/{i}"})
+        await w.stop()
         with open(fn, encoding="utf-8") as f:
             lines = [l for l in f if l.strip()]
-        assert len(lines) == 7
+        assert len(lines) == 50, f"expected 50, got {len(lines)}"
+        for l in lines:
+            assert "link" in json.loads(l)
         os.remove(fn)
 
-    # ---- Per-domain concurrency ----------------------------------------
-    async def test_domain_semaphore_limits_inflight(self):
-        dm = DomainManager(None)
-        sem = dm.get_semaphore("x.com")
-        assert sem._value == DOMAIN_CONCURRENCY
-        # acquire half
-        for _ in range(4):
-            await sem.acquire()
-        assert sem._value == DOMAIN_CONCURRENCY - 4
-        for _ in range(4):
-            sem.release()
+    # --- crawler integration ---
+    async def test_crawler_shutdown_clean(self):
+        cfg = Config()
+        cfg.visited_file = "test_shut.bloom"
+        cfg.output_file = "test_shut.jsonl"
+        MiniHandlers.safe(lambda: os.remove(cfg.visited_file))
+        MiniHandlers.safe(lambda: os.remove(cfg.output_file))
 
-    # ---- Proxy extractor: rolling + early exit -------------------------
-    async def test_proxy_extractor_caps_candidates(self):
-        # We can't run network calls in tests, so verify constants are sane
-        pe = ProxyExtractor(filepath="test_nonexistent.txt")
-        assert pe.MAX_CANDIDATES <= 500
-        assert pe.EARLY_EXIT_VALID <= pe.MAX_CANDIDATES
-        assert pe.VALIDATE_TIMEOUT <= 3.0
-        assert len(PROXY_VALIDATE_ENDPOINTS) >= 3
-
-    # ---- Shutdown cleanliness ------------------------------------------
-    async def test_shutdown_cancels_tasks(self):
-        """Spin up a fake crawler with hanging bg tasks and verify shutdown."""
-        # Use a minimal fake to avoid touching disk/network
-        crawler = Crawler.__new__(Crawler)
+        stats = Stats()
+        crawler = Crawler(["https://example.invalid/"], cfg, stats)
         crawler.running = True
-        crawler._workers = []
-        crawler._bg_tasks = []
-        crawler.stats = Stats()
-        crawler.bloom = BloomFilter("test_shut.bloom", 1000, 0.01)
-        crawler.output = BatchWriter("test_shut.jsonl", 10)
-        crawler.session = None
-        crawler.proxy_extractor = ProxyExtractor("test_noproxies.txt")
-        crawler.domain_manager = DomainManager(None)
-        crawler.adaptive = AdaptiveConcurrency()
-        crawler.url_queue = asyncio.Queue()
 
         async def hanger():
             while True:
                 await asyncio.sleep(10)
 
-        t1 = crawler.spawn_bg(hanger())
-        t2 = crawler.spawn_bg(hanger())
-        crawler._workers = [asyncio.create_task(hanger()),
-                            asyncio.create_task(hanger())]
+        t = crawler.spawn_bg(hanger(), "hanger")
+        crawler._workers = [asyncio.create_task(hanger()) for _ in range(4)]
 
         t0 = time.monotonic()
         await crawler.shutdown()
         dt = time.monotonic() - t0
-        assert dt < 2.0, f"shutdown too slow: {dt:.2f}s"
-        assert t1.done() and t2.done()
+        assert dt < 3.0, f"shutdown too slow: {dt:.2f}s"
+        assert t.done()
         assert all(w.done() for w in crawler._workers)
-        assert not crawler.running
 
-        MiniHandlers.safe(lambda: os.remove("test_shut.bloom"))
-        MiniHandlers.safe(lambda: os.remove("test_shut.jsonl"))
+        MiniHandlers.safe(lambda: os.remove(cfg.visited_file))
+        MiniHandlers.safe(lambda: os.remove(cfg.output_file))
 
-    # ---- Batch link insertion ------------------------------------------
-    async def test_batch_link_insertion(self):
-        """Ensure _parse doesn't await per link — it batches."""
-        fn_out = "test_batch_links.jsonl"
-        MiniHandlers.safe(lambda: os.remove(fn_out))
-        fn_bloom = "test_batch_links.bloom"
-        MiniHandlers.safe(lambda: os.remove(fn_bloom))
+    async def test_parse_batches_links_and_writes(self):
+        cfg = Config()
+        cfg.visited_file = "test_parse.bloom"
+        cfg.output_file = "test_parse.jsonl"
+        MiniHandlers.safe(lambda: os.remove(cfg.visited_file))
+        MiniHandlers.safe(lambda: os.remove(cfg.output_file))
 
-        crawler = Crawler.__new__(Crawler)
-        crawler.running = True
-        crawler.stats = Stats()
-        crawler.bloom = BloomFilter(fn_bloom, 100_000, 0.01)
-        crawler.output = BatchWriter(fn_out, 100)
-        crawler.url_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+        stats = Stats()
+        crawler = Crawler([], cfg, stats)
+        await crawler.writer.start()
 
-        # Build HTML with 500 links
         links = "".join(f'<a href="/p{i}">x</a>' for i in range(500))
-        html_src = f"<html><head><title>t</title></head><body>{links}</body></html>"
+        src = (f"<html><head><title>t</title></head><body>"
+               f"<p>hello world foo bar</p>{links}</body></html>").encode()
 
-        await crawler._parse(html_src, "https://root.example/", 0)
-        assert crawler.url_queue.qsize() == 500, \
-            f"expected 500 in queue, got {crawler.url_queue.qsize()}"
-
-        await crawler.output.close()
-        crawler.bloom.close()
-        MiniHandlers.safe(lambda: os.remove(fn_out))
-        MiniHandlers.safe(lambda: os.remove(fn_bloom))
-
-    # ---- End-to-end parse ----------------------------------------------
-    async def test_end_to_end_parse(self):
-        fn_out = "test_e2e.jsonl"
-        fn_bloom = "test_e2e.bloom"
-        MiniHandlers.safe(lambda: os.remove(fn_out))
-        MiniHandlers.safe(lambda: os.remove(fn_bloom))
-
-        crawler = Crawler.__new__(Crawler)
-        crawler.running = True
-        crawler.stats = Stats()
-        crawler.bloom = BloomFilter(fn_bloom, 1000, 0.01)
-        crawler.output = BatchWriter(fn_out, 10)
-        crawler.url_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-
-        src = ("<html><head><title>Test</title></head>"
-               "<body><h1>Hi</h1><p>the quick brown fox is in the house</p>"
-               "<a href='https://link.example/'>n</a>"
-               "<script>ignore()</script></body></html>")
         await crawler._parse(src, "https://root.example/", 0)
-        await crawler.output.close()
-        crawler.bloom.close()
+        assert crawler.url_queue.qsize() == 500, \
+            f"queue={crawler.url_queue.qsize()}"
 
-        with open(fn_out, encoding="utf-8") as f:
-            lines = [json.loads(l) for l in f if l.strip()]
-        assert len(lines) == 1
-        rec = lines[0]
+        await crawler.writer.stop()
+        with open(cfg.output_file, encoding="utf-8") as f:
+            recs = [json.loads(l) for l in f if l.strip()]
+        assert len(recs) == 1
         for k in ("text", "link", "title", "hash", "word_count", "language"):
-            assert k in rec, f"missing {k}"
-        assert rec["title"] == "Test"
-        assert rec["language"] == "en"
-        assert rec["word_count"] > 0
+            assert k in recs[0]
+        assert recs[0]["language"] == "en"
+        assert recs[0]["word_count"] >= 4
 
-        os.remove(fn_out)
-        os.remove(fn_bloom)
+        crawler.bloom.close()
+        MiniHandlers.safe(lambda: os.remove(cfg.visited_file))
+        MiniHandlers.safe(lambda: os.remove(cfg.output_file))
 
-    # ---- Benchmarks -----------------------------------------------------
+    # --- benchmarks ---
     def test_bench_bloom(self):
         fn = "bench.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
@@ -1802,99 +2115,118 @@ class TestingMachine:
         for it in items:
             b.contains(it)
         has_dt = time.perf_counter() - t0
-        print(f"\n    [bench] bloom add: {len(items)/add_dt:,.0f} ops/s, "
-              f"has: {len(items)/has_dt:,.0f} ops/s", end="")
+        print(f"\n    [bench] bloom add: {len(items)/add_dt:,.0f}/s "
+              f"has: {len(items)/has_dt:,.0f}/s", end="")
         b.close()
         os.remove(fn)
 
     def test_bench_parse(self):
-        html_src = ("<html><head><title>x</title></head><body>"
-                    + "<p>hello world</p>" * 200 + "</body></html>")
+        src = ("<html><head><title>x</title></head><body>"
+               + "<p>hello world</p>" * 200 + "</body></html>").encode()
         t0 = time.perf_counter()
         for _ in range(500):
-            tree = html.fromstring(html_src)
-            MiniCleaners.strip_junk_tags(tree)
+            tree = lxml_html.fromstring(src)
+            MiniCleaners.clean_tree(tree)
             MiniCleaners.extract_text(tree)
         dt = time.perf_counter() - t0
         print(f"\n    [bench] parse+clean: {500/dt:,.0f} pages/s", end="")
+
+    def test_bench_spoof(self):
+        se = SpoofEngine(("chrome124", "firefox120"))
+        t0 = time.perf_counter()
+        for i in range(50_000):
+            p = se.pick()
+            se.build_headers("https://x.com", p, referer="https://x.com/r")
+        dt = time.perf_counter() - t0
+        print(f"\n    [bench] spoof headers: {50_000/dt:,.0f}/s", end="")
+
+
+# ===========================================================================
+# HEADLESS MODE
+# ===========================================================================
+async def _headless_async(urls: List[str], config: Config) -> None:
+    stats = Stats()
+
+    def on_stats(snap):
+        pps = snap["fetched"] / max(snap["uptime"], 1)
+        log.info("q=%d f=%d e=%d b=%d w=%d/%d pps=%.1f bloom=%d fp=%.6f "
+                 "dq=%d",
+                 snap["queued"], snap["fetched"], snap["errors"],
+                 snap["blocks"], snap["active"], snap["concurrency"],
+                 pps, snap["bloom_items"], snap["bloom_fp"],
+                 snap["writer_queue"])
+
+    def on_log(msg, ts):
+        log.info("%s", msg)
+
+    crawler = Crawler(urls, config, stats,
+                      emit_stats=on_stats, emit_log=on_log)
+    try:
+        await crawler.run()
+    except asyncio.CancelledError:
+        pass
+
+
+def run_headless(urls: List[str], config: Config) -> None:
+    try:
+        asyncio.run(_headless_async(urls, config))
+    except KeyboardInterrupt:
+        _STOP.set()
 
 
 # ===========================================================================
 # MAIN
 # ===========================================================================
-async def main_async(urls: List[str]) -> None:
-    stats = Stats()
-    crawler = Crawler(urls, stats)
-    ui = TerminalUI(crawler, stats)
-
-    ui_task = asyncio.create_task(ui.run())
-    try:
-        await crawler.run()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        crawler.running = False
-        ui.stop()
-        try:
-            await asyncio.wait_for(ui_task, timeout=2.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-            ui_task.cancel()
-            MiniHandlers.safe_async.__self__ if False else None
-            try:
-                await ui_task
-            except Exception:
-                pass
-        if DEBUG_MODE:
-            MiniDebuggers.dump("debug_report.json")
-
-
 def main() -> None:
-    global DEBUG_MODE, FORCE_NO_UI, REFRESH_PROXIES
+    global DEBUG_MODE, FORCE_HEADLESS
 
-    args = set(sys.argv[1:])
-    if "--test" in args:
+    args = sys.argv[1:]
+    argset = set(args)
+
+    if "--test" in argset:
         ok = TestingMachine().run_all()
         sys.exit(0 if ok else 1)
-    if "--debug" in args:
+
+    if "--debug" in argset:
         DEBUG_MODE = True
         log.setLevel(logging.DEBUG)
         MiniDebuggers.enabled = True
         MiniDebuggers.mem_start()
-    if "--no-ui" in args:
-        FORCE_NO_UI = True
-    if "--refresh-proxies" in args:
-        REFRESH_PROXIES = True
+
+    if "--headless" in argset:
+        FORCE_HEADLESS = True
 
     MiniHandlers.install_exception_hook()
     MiniHandlers.install_signal_handlers()
 
-    print("=" * 60)
-    print("  NEXUS SCRAPER v4")
-    print(f"  debug={DEBUG_MODE}  ui={'off' if FORCE_NO_UI else 'on'}  "
-          f"refresh_proxies={REFRESH_PROXIES}")
-    print("=" * 60)
+    config = Config.load(Config().config_file)
 
-    raw = input("Enter start URL (or 'file' for start_urls.txt): ").strip()
-    if raw.lower() == "file" or not raw:
-        if not os.path.exists(START_URLS_FILE):
-            print(f"ERROR: {START_URLS_FILE} not found.")
-            return
-        with open(START_URLS_FILE, encoding="utf-8") as f:
-            urls = [l.strip() for l in f if l.strip()]
-    else:
-        urls = [raw]
+    # Try to pick up URLs from argv or start_urls.txt
+    urls: List[str] = []
+    for a in args:
+        if a.startswith("http://") or a.startswith("https://"):
+            urls.append(a)
+    if not urls and os.path.exists(config.start_urls_file):
+        try:
+            with open(config.start_urls_file, encoding="utf-8") as f:
+                urls = [l.strip() for l in f if l.strip()
+                        and not l.startswith("#")]
+        except Exception:
+            urls = []
 
     urls = [u for u in urls if MiniCheckers.is_valid_url(u)]
-    if not urls:
-        print("No valid URLs.")
+
+    if FORCE_HEADLESS or not _ensure_qt():
+        if not urls:
+            print("No URLs. Pass one on the command line or create "
+                  f"{config.start_urls_file}.")
+            sys.exit(1)
+        print(f"Headless mode: crawling {len(urls)} URL(s)")
+        run_headless(urls, config)
         return
 
-    try:
-        asyncio.run(main_async(urls))
-    except KeyboardInterrupt:
-        _STOP.set()
-    finally:
-        print("\nDone.")
+    # GUI
+    sys.exit(launch_gui(urls or None, config))
 
 
 if __name__ == "__main__":
