@@ -1102,7 +1102,7 @@ class Crawler:
         # 2. Session
         self.session = AsyncSession(
             max_clients=self.config.adaptive_max,
-            max_concurrent=self.config.adaptive_max,
+            max_clients_per_host=self.config.domain_concurrency * 4,
             http2=True,
         )
 
