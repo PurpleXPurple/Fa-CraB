@@ -1816,9 +1816,9 @@ def launch_gui(urls: Optional[List[str]], config: Config) -> int:
         print("Falling back to headless mode.")
         return 1
     CrawlerThread, NexusWindow = _build_gui_classes()
-    app = QApplication(sys.argv)
+    app = QtW.QApplication(sys.argv)
     app.setApplicationName("Nexus Scraper")
-    font = QFont("Segoe UI" if sys.platform == "win32" else "Sans", 10)
+    font = QtG.QFont("Segoe UI" if sys.platform == "win32" else "Sans", 10)
     app.setFont(font)
     win = NexusWindow(config)
     if urls:
