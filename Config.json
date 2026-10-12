@@ -1425,6 +1425,15 @@
       "fail": 1,
       "promoted": false,
       "last_fail": 1791821717
+    },
+    "en.wikipedia.org": {
+      "agent": "firefox147_win",
+      "rate": 2.0,
+      "first_seen": 1791821786,
+      "ok": 0,
+      "fail": 1,
+      "promoted": false,
+      "last_fail": 1791821786
     }
   }
 }

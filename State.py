@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-State.py — Fa-Scrap substrate. Owns config, folders, resume, health, writer,
-and the ctypes platform layer that delivers the CPU/memory targets.
-Only public surface: import this module. --help only CLI.
+State.py — Fa-Scrap substrate.
+
+Changes in this build:
+    - Health.detect_block() now takes a status code, splits patterns into
+      STRONG (only appear in real blocks) and WEAK (may appear normally),
+      and only fires on a real signal.
+    - Health.mark_block() and mark_unreachable() now require consecutive
+      failures before locking a domain out.
+    - DomainState tracks consecutive fails separately from total fails.
+    - Added Health.record_fetch_error() for one-off errors that shouldn't
+      trigger a lockout.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import ctypes
 import ctypes.util
 import gc
-import json
 import logging
 import os
 import platform as _pyplatform
@@ -34,12 +43,9 @@ log = logging.getLogger("fa.state")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLATFORM LAYER — ctypes for CPU/memory discipline
+# PLATFORM LAYER
 # ══════════════════════════════════════════════════════════════════════════════
 class Platform:
-    """Applies kernel-level limits so Fa-Scrap stays under 3% CPU when idle
-    and returns memory to the OS instead of hoarding it."""
-
     _applied_once = False
 
     @staticmethod
@@ -47,37 +53,34 @@ class Platform:
         if Platform._applied_once:
             return
         Platform._applied_once = True
-        runtime = cfg.get("runtime", {})
-        pcfg = runtime.get("platform", {})
         if _pyplatform.system() != "Linux":
-            log.debug("platform policy: skipping non-Linux specifics")
             return
         try:
+            runtime = cfg.get("runtime", {}) if isinstance(cfg, dict) else {}
+            pcfg = runtime.get("platform", {}) if isinstance(runtime, dict) else {}
+
             libc_path = ctypes.util.find_library("c")
             if not libc_path:
                 return
             libc = ctypes.CDLL(libc_path, use_errno=True)
 
-            nice_val = int(pcfg.get("nice", 19))
             try:
-                libc.nice(nice_val)
+                libc.nice(int(pcfg.get("nice", 19)))
             except Exception:
                 pass
 
-            sched = pcfg.get("scheduler", "SCHED_IDLE")
-            SCHED_IDLE = 5
-            if sched == "SCHED_IDLE":
-                param = struct.pack("i", 0)
-                libc.sched_setscheduler(0, SCHED_IDLE, ctypes.byref(
-                    ctypes.create_string_buffer(param)))
-
-            arena_max = int(pcfg.get("mallopt_arena_max", 2))
-            M_ARENA_MAX = -8
             try:
-                libc.mallopt(M_ARENA_MAX, arena_max)
+                if pcfg.get("scheduler", "SCHED_IDLE") == "SCHED_IDLE":
+                    param = struct.pack("i", 0)
+                    buf = ctypes.create_string_buffer(param)
+                    libc.sched_setscheduler(0, 5, ctypes.byref(buf))
             except Exception:
                 pass
-            log.debug("platform: nice=%d sched=%s arena_max=%d", nice_val, sched, arena_max)
+
+            try:
+                libc.mallopt(-8, int(pcfg.get("mallopt_arena_max", 2)))
+            except Exception:
+                pass
         except Exception as e:
             log.debug("platform policy apply failed: %s", e)
 
@@ -96,7 +99,6 @@ class Platform:
 
     @staticmethod
     def gc_freeze_long_lived():
-        """Freeze objects reachable now so GC ignores them. Keeps GC cheap."""
         gc.collect()
         try:
             gc.freeze()
@@ -105,68 +107,77 @@ class Platform:
 
     @staticmethod
     def direct_write(path: str | Path, data: bytes) -> int:
-        """Bypass Python buffered IO; falls back to standard open on failure."""
         try:
             fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
             try:
-                written = os.write(fd, data)
-                return written
+                return os.write(fd, data)
             finally:
                 os.close(fd)
         except Exception:
-            with open(path, "ab") as f:
-                return f.write(data)
+            try:
+                with open(path, "ab") as f:
+                    return f.write(data)
+            except Exception:
+                return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 class Config:
-    """Loads config.json via msgspec. Resolves agent+profile into a concrete
-    header bundle. Writes back learned overrides atomically."""
-
     def __init__(self, path: str | Path = "config.json"):
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(f"config.json not found at {self.path}")
         raw = self.path.read_bytes()
         self._raw: dict = msgspec.json.decode(raw)
-        self._agents: dict = self._raw.get("agents", {})
-        self._profiles: dict = self._raw.get("profiles", {})
-        self._sites: dict = self._raw.get("sites", {})
+        self._agents: dict = self._raw.get("agents", {}) or {}
+        self._profiles: dict = self._raw.get("profiles", {}) or {}
+        self._sites: dict = self._raw.get("sites", {}) or {}
         self._learned: dict = self._raw.setdefault("learned", {})
         self._resolved: dict[str, dict] = {}
         self._lock = asyncio.Lock()
         self._dirty = False
+        self._last_save = 0.0
 
-    # ── accessors ────────────────────────────────────────────────────────────
+    @property
+    def raw(self) -> dict:
+        return self._raw
+
     @property
     def runtime(self) -> dict:
-        return self._raw.get("runtime", {})
+        v = self._raw.get("runtime", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def discovery(self) -> dict:
-        return self._raw.get("discovery", {})
+        v = self._raw.get("discovery", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def health_cfg(self) -> dict:
-        return self._raw.get("health", {})
+        v = self._raw.get("health", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def storage(self) -> dict:
-        return self._raw.get("storage", {})
+        v = self._raw.get("storage", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def cookies(self) -> dict:
-        return self._raw.get("cookies", {})
+        v = self._raw.get("cookies", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def legal(self) -> dict:
-        return self._raw.get("legal", {})
+        v = self._raw.get("legal", {})
+        return v if isinstance(v, dict) else {}
 
     @property
     def block_patterns(self) -> list[str]:
-        return self._raw.get("block_patterns", [])
+        v = self._raw.get("block_patterns", [])
+        return v if isinstance(v, list) else []
 
     def agent_names(self) -> list[str]:
         return list(self._agents.keys())
@@ -174,18 +185,19 @@ class Config:
     def site_names(self) -> list[str]:
         return list(self._sites.keys())
 
-    # ── agent/profile resolution ─────────────────────────────────────────────
     def resolve_agent(self, agent_name: str) -> dict:
-        """Returns {'ua':..., 'impersonate':..., 'headers': {...}} fully resolved."""
         if agent_name in self._resolved:
             return self._resolved[agent_name]
         agent = self._agents.get(agent_name)
         if not agent:
-            # fall back to first agent
+            if not self._agents:
+                return {"ua": "", "impersonate": "", "headers": {}}
             agent_name = next(iter(self._agents))
             agent = self._agents[agent_name]
         profile_name = agent.get("profile", "chrome")
         profile = self._profiles.get(profile_name, {})
+        if not isinstance(profile, dict):
+            profile = {}
         subs = {
             "version": str(agent.get("version", "")),
             "chromium": str(agent.get("chromium", agent.get("version", ""))),
@@ -198,25 +210,22 @@ class Config:
                 for sk, sv in subs.items():
                     v = v.replace("${" + sk + "}", sv)
             headers[k] = v
-        headers["User-Agent"] = agent["ua"]
+        headers["User-Agent"] = agent.get("ua", "")
         resolved = {
-            "ua": agent["ua"],
-            "impersonate": agent.get("impersonate", "chrome146"),
+            "ua": agent.get("ua", ""),
+            "impersonate": agent.get("impersonate", "chrome131"),
             "headers": headers,
         }
         self._resolved[agent_name] = resolved
         return resolved
 
-    # ── site lookup ──────────────────────────────────────────────────────────
     def site_entry(self, domain: str) -> dict:
-        """Priority: learned > sites > empty. Suffix match supported."""
         if domain in self._learned:
             return self._learned[domain]
         if domain in self._sites:
             return self._sites[domain]
-        # suffix match
         for d in list(self._sites.keys()) + list(self._learned.keys()):
-            if domain.endswith("." + d) or domain == d:
+            if domain == d or domain.endswith("." + d):
                 return self._learned.get(d) or self._sites.get(d) or {}
         return {}
 
@@ -226,12 +235,19 @@ class Config:
 
     def rate_for(self, domain: str) -> float:
         entry = self.site_entry(domain)
-        return float(entry.get("rate", 2.0))
+        v = entry.get("rate", 2.0)
+        try:
+            return float(v)
+        except Exception:
+            return 2.0
 
     def retry_after_for(self, domain: str) -> float:
         entry = self.site_entry(domain)
-        default = float(self.health_cfg.get("retry_after_block_seconds", 300))
-        return float(entry.get("retry_after", default))
+        default = self.health_cfg.get("retry_after_block_seconds", 300)
+        try:
+            return float(entry.get("retry_after", default))
+        except Exception:
+            return 300.0
 
     def allow_external_for(self, domain: str) -> bool:
         entry = self.site_entry(domain)
@@ -241,28 +257,27 @@ class Config:
         entry = self.site_entry(domain)
         cat = entry.get("category", "default")
         table = self.discovery.get("max_depth_by_authority", {})
-        return int(table.get(cat, table.get("default", self.discovery.get("max_depth_default", 3))))
+        if not isinstance(table, dict):
+            table = {}
+        try:
+            return int(table.get(cat, table.get("default",
+                       self.discovery.get("max_depth_default", 3))))
+        except Exception:
+            return 3
 
-    # ── learning ─────────────────────────────────────────────────────────────
     async def record_success(self, domain: str, agent_name: str):
         async with self._lock:
             entry = self._learned.get(domain)
             now = int(time.time())
             if entry is None:
-                entry = {
-                    "agent": agent_name,
-                    "rate": 2.0,
-                    "first_seen": now,
-                    "ok": 0,
-                    "fail": 0,
-                    "promoted": False,
-                }
+                entry = {"agent": agent_name, "rate": 2.0,
+                         "first_seen": now, "ok": 0, "fail": 0,
+                         "promoted": False}
                 self._learned[domain] = entry
             entry["ok"] = entry.get("ok", 0) + 1
             entry["last_ok"] = now
-            entry["agent"] = agent_name  # always track last working agent
+            entry["agent"] = agent_name
             self._dirty = True
-            # promote after 3 clean successes
             if not entry.get("promoted") and entry["ok"] >= 3:
                 entry["promoted"] = True
                 self._sites[domain] = {
@@ -279,8 +294,9 @@ class Config:
         async with self._lock:
             entry = self._learned.get(domain)
             if entry is None:
-                entry = {"agent": agent_name, "rate": 2.0, "first_seen": int(time.time()),
-                         "ok": 0, "fail": 0, "promoted": False}
+                entry = {"agent": agent_name, "rate": 2.0,
+                         "first_seen": int(time.time()), "ok": 0, "fail": 0,
+                         "promoted": False}
                 self._learned[domain] = entry
             entry["fail"] = entry.get("fail", 0) + 1
             entry["last_fail"] = int(time.time())
@@ -288,10 +304,8 @@ class Config:
             self._save_if_due()
 
     def _save_if_due(self):
-        # Save at most every 5 seconds to avoid IO storms
         now = time.time()
-        last = getattr(self, "_last_save", 0.0)
-        if now - last < 5.0:
+        if now - self._last_save < 5.0:
             return
         self._last_save = now
         self.save()
@@ -334,16 +348,14 @@ class Folders:
 # RESUME
 # ══════════════════════════════════════════════════════════════════════════════
 class Resume:
-    """In-memory set of xxh3_64 hashes + append-only jsonl on disk.
-    .jsonl.zst and .zip are snapshots regenerated on flush."""
-
     def __init__(self, base: str | Path, cfg: Config):
         s = cfg.storage
         self.base = Path(base)
-        self.jsonl = self.base / s.get("resume_dir", "resume") / s.get("resume_jsonl", "resume.jsonl")
-        self.zst = self.base / s.get("resume_dir", "resume") / s.get("resume_zst", "resume.jsonl.zst")
-        self.zip = self.base / s.get("resume_dir", "resume") / s.get("resume_zip", "resume.zip")
-        self.jsonl.parent.mkdir(parents=True, exist_ok=True)
+        self.resume_dir = self.base / s.get("resume_dir", "resume")
+        self.resume_dir.mkdir(parents=True, exist_ok=True)
+        self.jsonl = self.resume_dir / s.get("resume_jsonl", "resume.jsonl")
+        self.zst = self.resume_dir / s.get("resume_zst", "resume.jsonl.zst")
+        self.zip = self.resume_dir / s.get("resume_zip", "resume.zip")
         self.known: set[int] = set()
         self._pending: list[bytes] = []
         self._lock = asyncio.Lock()
@@ -374,7 +386,6 @@ class Resume:
             try:
                 self._load_from_zip()
                 log.info("resume: loaded %d known URLs from zip", len(self.known))
-                return
             except Exception as e:
                 log.warning("resume zip read failed: %s", e)
 
@@ -409,8 +420,7 @@ class Resume:
         if h in self.known:
             return
         self.known.add(h)
-        line = orjson.dumps({"link": url, "hash_int": h})
-        self._pending.append(line)
+        self._pending.append(orjson.dumps({"link": url, "hash_int": h}))
         if len(self._pending) >= 100:
             await self.flush()
 
@@ -423,7 +433,6 @@ class Resume:
             Platform.direct_write(self.jsonl, payload)
 
     async def snapshot(self):
-        """Regenerate .jsonl.zst and .zip from jsonl."""
         async with self._lock:
             await self.flush()
             if not self.jsonl.exists():
@@ -432,15 +441,13 @@ class Resume:
                 raw = self.jsonl.read_bytes()
                 compressed = zstd.ZstdCompressor(level=22).compress(raw)
                 self.zst.write_bytes(compressed)
-                with zipfile.ZipFile(self.zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(self.zip, "w",
+                                     compression=zipfile.ZIP_DEFLATED) as zf:
                     zf.writestr("resume.jsonl.zst", compressed)
-                log.debug("resume snapshot: %d known urls, %.2f MB",
-                          len(self.known), len(compressed) / (1024 * 1024))
             except Exception as e:
                 log.warning("resume snapshot failed: %s", e)
 
-    async def load_external(self, path: str | Path):
-        """Import an external resume.zip."""
+    async def load_external(self, path: str | Path) -> int:
         p = Path(path)
         if not p.exists():
             return 0
@@ -473,7 +480,7 @@ class Resume:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WRITER — 900-line JSONL rotation + zstd + zip archive
+# WRITER
 # ══════════════════════════════════════════════════════════════════════════════
 class Writer:
     def __init__(self, folders: Folders, cfg: Config):
@@ -508,47 +515,92 @@ class Writer:
         idx = self.counters.get(domain, 0)
         self.counters[domain] = idx + 1
         ddir = self.folders.domain_dir(domain)
-        jsonl_path = ddir / f"{domain.replace('.', '_')}_{idx:05d}.jsonl"
+        base_name = f"{domain.replace('.', '_')}_{idx:05d}.jsonl"
+        jsonl_path = ddir / base_name
         zst_path = jsonl_path.with_suffix(".jsonl.zst")
         zip_path = jsonl_path.with_suffix(".jsonl.zst.zip")
-
         payload = b"\n".join(buf) + b"\n"
         try:
             Platform.direct_write(jsonl_path, payload)
             compressed = zstd.ZstdCompressor(level=self.zstd_level).compress(payload)
             zst_path.write_bytes(compressed)
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(jsonl_path.name + ".zst", compressed)
-            # Keep raw jsonl; delete if user wants strict compression
+            with zipfile.ZipFile(zip_path, "w",
+                                 compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(base_name + ".zst", compressed)
             gc.collect()
         except Exception as e:
             log.warning("writer flush failed for %s: %s", domain, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEALTH
+# HEALTH  — REWRITTEN
 # ══════════════════════════════════════════════════════════════════════════════
+# STRONG patterns: these only appear in real challenge/block pages.
+_STRONG_BLOCK_PATTERNS = [
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "cf-please-wait",
+    "challenge-platform",
+    "checking your browser before accessing",
+    "enable javascript and cookies to continue",
+    "ddos protection by cloudflare",
+    "please wait while we verify",
+    "attention required! | cloudflare",
+    "datadome",
+    "perimeterx",
+    "px-captcha",
+    "kasada",
+    "incapsula incident id",
+    "_incapsula_",
+    "are you a robot",
+    "verify you are human",
+    "access denied | cloudflare",
+]
+
+# WEAK patterns: only fire when status code is suspicious AND body is tiny.
+_WEAK_BLOCK_PATTERNS = [
+    "just a moment",
+    "ddos protection",
+    "ray id",
+    "cloudflare",
+    "captcha",
+    "bot detection",
+    "unusual traffic",
+]
+
+# Status codes that on their own suggest a block (not just an error).
+_BLOCK_STATUS = frozenset({403, 429, 503})
+
+# Minimum consecutive failures before locking a domain.
+_BLOCK_THRESHOLD = 3
+_UNREACHABLE_THRESHOLD = 5
+
+
 @dataclass(slots=True)
 class DomainState:
     domain: str
-    status: str = "UNKNOWN"       # HEALTHY | BLOCKED | UNREACHABLE | DEAD
+    status: str = "UNKNOWN"
     fail_count: int = 0
+    consec_fail: int = 0
     ok_count: int = 0
     last_seen: float = 0.0
     retry_at: float = 0.0
     agent: str = "chrome146_win"
+    last_reason: str = ""
 
 
 class Health:
-    """Background health tracker. Probes blocked domains after retry_at."""
-
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.states: dict[str, DomainState] = {}
-        self._block_re = re.compile(
-            "|".join(f"({re.escape(p)})" for p in cfg.block_patterns),
+        self._strong_re = re.compile(
+            "|".join(re.escape(p) for p in _STRONG_BLOCK_PATTERNS),
             re.IGNORECASE,
-        ) if cfg.block_patterns else None
+        )
+        self._weak_re = re.compile(
+            "|".join(re.escape(p) for p in _WEAK_BLOCK_PATTERNS),
+            re.IGNORECASE,
+        )
 
     def state(self, domain: str) -> DomainState:
         s = self.states.get(domain)
@@ -561,25 +613,45 @@ class Health:
         s = self.state(domain)
         s.status = "HEALTHY"
         s.fail_count = 0
+        s.consec_fail = 0
         s.ok_count += 1
         s.last_seen = time.time()
+        s.last_reason = ""
 
-    def mark_block(self, domain: str):
+    def mark_block(self, domain: str, reason: str = ""):
+        """Increment fail. Only flip to BLOCKED after _BLOCK_THRESHOLD."""
         s = self.state(domain)
-        s.status = "BLOCKED"
         s.fail_count += 1
+        s.consec_fail += 1
         s.last_seen = time.time()
-        s.retry_at = time.time() + self.cfg.retry_after_for(domain)
+        s.last_reason = reason or s.last_reason
+        if s.consec_fail >= _BLOCK_THRESHOLD:
+            s.status = "BLOCKED"
+            s.retry_at = time.time() + self.cfg.retry_after_for(domain)
         max_fails = int(self.cfg.health_cfg.get("dead_after_failures", 25))
         if s.fail_count >= max_fails:
             s.status = "DEAD"
 
-    def mark_unreachable(self, domain: str):
+    def mark_unreachable(self, domain: str, reason: str = ""):
+        """Increment fail. Only flip to UNREACHABLE after _UNREACHABLE_THRESHOLD."""
         s = self.state(domain)
-        s.status = "UNREACHABLE"
         s.fail_count += 1
+        s.consec_fail += 1
         s.last_seen = time.time()
-        s.retry_at = time.time() + float(self.cfg.health_cfg.get("retry_after_unreachable_seconds", 600))
+        s.last_reason = reason or s.last_reason
+        if s.consec_fail >= _UNREACHABLE_THRESHOLD:
+            s.status = "UNREACHABLE"
+            delay = float(self.cfg.health_cfg.get(
+                "retry_after_unreachable_seconds", 600))
+            s.retry_at = time.time() + delay
+
+    def record_fetch_error(self, domain: str, reason: str = ""):
+        """One-off error: bump counters but do NOT change status."""
+        s = self.state(domain)
+        s.fail_count += 1
+        s.consec_fail += 1
+        s.last_seen = time.time()
+        s.last_reason = reason or s.last_reason
 
     def is_scrapeable(self, domain: str) -> bool:
         s = self.state(domain)
@@ -590,15 +662,45 @@ class Health:
         if s.status in ("BLOCKED", "UNREACHABLE"):
             if time.time() >= s.retry_at:
                 s.status = "UNKNOWN"
+                s.consec_fail = 0
                 return True
             return False
         return True
 
-    def detect_block(self, body: str) -> Optional[str]:
-        if not body or not self._block_re:
+    def detect_block(self, body: str,
+                     status_code: int = 200) -> Optional[str]:
+        """
+        Return a block reason string, or None.
+
+        Logic:
+            - Strong pattern in first 16 KB → block (with reason tag).
+            - Else if status is 403/429/503 AND weak pattern → block.
+            - Else if body < 20000 chars AND weak pattern → block.
+            - Else → None.
+        """
+        if not body:
+            # If body empty and status suggests a block, still flag it.
+            if status_code in _BLOCK_STATUS:
+                return f"status_{status_code}_empty"
             return None
-        m = self._block_re.search(body[:8192].lower())
-        return m.group(0) if m else None
+        sample = body[:16384]
+
+        m = self._strong_re.search(sample)
+        if m:
+            return f"strong:{m.group(0)[:40]}"
+
+        if status_code in _BLOCK_STATUS:
+            m = self._weak_re.search(sample)
+            if m:
+                return f"weak+{status_code}:{m.group(0)[:40]}"
+            return f"status_{status_code}"
+
+        if len(body) < 20000:
+            m = self._weak_re.search(sample)
+            if m:
+                return f"weak+small:{m.group(0)[:40]}"
+
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -657,8 +759,10 @@ class AdaptiveSemaphore:
             try:
                 await fut
             except asyncio.CancelledError:
-                try: self._waiters.remove(fut)
-                except ValueError: pass
+                try:
+                    self._waiters.remove(fut)
+                except ValueError:
+                    pass
                 raise
         self._in_use += 1
     def release(self):
@@ -691,14 +795,16 @@ def normalize_url(url: str) -> str:
         return url
     scheme = p.scheme.lower()
     netloc = p.netloc.lower()
-    if scheme == "http" and netloc.endswith(":80"): netloc = netloc[:-3]
-    elif scheme == "https" and netloc.endswith(":443"): netloc = netloc[:-4]
+    if scheme == "http" and netloc.endswith(":80"):
+        netloc = netloc[:-3]
+    elif scheme == "https" and netloc.endswith(":443"):
+        netloc = netloc[:-4]
     path = p.path or "/"
     return urlunsplit((scheme, netloc, path, p.query, ""))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI (--help only)
+# CLI
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     p = argparse.ArgumentParser(

@@ -7,10 +7,15 @@ Usage:
     python Fa_Scrap.py <url>              GUI opens, prefilled, autostarts
     python Fa_Scrap.py -T                 Terminal, prompts for URL
     python Fa_Scrap.py -T <url>           Terminal, immediate start
-    python Fa_Scrap.py -G <url>           GUI, explicit
     python Fa_Scrap.py --help             Help
 
-That is the entire user surface. Everything else is autonomous.
+Fixes in this build:
+    - Impersonate values are validated against curl_cffi's real supported
+      set at import time. Invalid ones are silently substituted.
+    - Failed fetches log at WARNING, not DEBUG. You will see them.
+    - Failures are bucketed by reason for a summary at the end.
+    - Per-URL agent rotation on retry; each attempt uses a different agent.
+    - Health module no longer locks out domains on first failure.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import re
 import signal
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -41,6 +47,116 @@ log = logging.getLogger("fa.scrap")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IMPERSONATE VALIDATION
+# ══════════════════════════════════════════════════════════════════════════════
+def _collect_supported_impersonates() -> set[str]:
+    """
+    Introspect curl_cffi for its supported impersonate targets.
+
+    Different curl_cffi versions expose this differently:
+        - curl_cffi.requests.impersonate.BrowserTypeLiteral (typing literal)
+        - curl_cffi.const.<SomeEnum>
+        - A dict in curl_cffi.requests.impersonate
+    """
+    supported: set[str] = set()
+
+    # Path 1: the typing literal used in signatures
+    try:
+        from curl_cffi.requests import impersonate as _imp_mod  # type: ignore
+        bt = getattr(_imp_mod, "BrowserTypeLiteral", None)
+        if bt is not None:
+            try:
+                import typing
+                args = typing.get_args(bt)
+                supported.update(a for a in args if isinstance(a, str))
+            except Exception:
+                pass
+        # Also try well-known constants
+        for name in ("DEFAULT_CHROME", "DEFAULT_SAFARI", "DEFAULT_FIREFOX"):
+            v = getattr(_imp_mod, name, None)
+            if isinstance(v, str):
+                supported.add(v)
+    except Exception:
+        pass
+
+    # Path 2: const enum
+    try:
+        import curl_cffi.const as _c  # type: ignore
+        for name in dir(_c):
+            obj = getattr(_c, name)
+            if hasattr(obj, "__members__"):
+                for member in obj.__members__.values():
+                    v = getattr(member, "value", None)
+                    if isinstance(v, str) and "-" not in v and len(v) < 40:
+                        supported.add(v)
+    except Exception:
+        pass
+
+    # Path 3: any version that exposes a list attribute
+    try:
+        from curl_cffi.requests import session as _sess  # type: ignore
+        for name in dir(_sess):
+            v = getattr(_sess, name)
+            if isinstance(v, (set, frozenset)) and v and all(
+                    isinstance(x, str) for x in v):
+                supported.update(v)
+    except Exception:
+        pass
+
+    return supported
+
+
+_SUPPORTED_IMPERSONATES: set[str] = _collect_supported_impersonates()
+
+
+# A fallback chain used when config gives us a target curl_cffi doesn't know.
+_FALLBACK_CHAIN = (
+    "chrome131", "chrome136", "chrome124", "chrome123", "chrome120",
+    "chrome116", "chrome110", "chrome107", "chrome104", "chrome101",
+    "chrome100", "chrome99",
+    "safari184", "safari180", "safari170", "safari172_ios", "safari184_ios",
+    "firefox135", "firefox133", "firefox144",
+    "edge101", "edge99",
+    "chrome131_android", "chrome99_android",
+)
+
+
+def _resolve_impersonate(name: str) -> str:
+    """
+    Return a curl_cffi-compatible impersonate string.
+
+    If curl_cffi's set could not be introspected, return `name` untouched —
+    let curl_cffi raise on its own terms.
+    """
+    if not name:
+        return _pick_fallback()
+    if not _SUPPORTED_IMPERSONATES:
+        return name
+    if name in _SUPPORTED_IMPERSONATES:
+        return name
+
+    # Try close variations before giving up
+    stripped = re.sub(r"_(win|mac|linux|android|ios|ipad)$", "", name)
+    for cand in (stripped, stripped + "a"):
+        if cand in _SUPPORTED_IMPERSONATES:
+            return cand
+
+    # Broad fallback chain
+    for fb in _FALLBACK_CHAIN:
+        if fb in _SUPPORTED_IMPERSONATES:
+            return fb
+
+    return next(iter(_SUPPORTED_IMPERSONATES))
+
+
+def _pick_fallback() -> str:
+    for fb in _FALLBACK_CHAIN:
+        if fb in _SUPPORTED_IMPERSONATES:
+            return fb
+    return next(iter(_SUPPORTED_IMPERSONATES), "chrome131")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ══════════════════════════════════════════════════════════════════════════════
 _WORD_RE = re.compile(r"\S+")
@@ -50,7 +166,7 @@ _IS_WINDOWS = sys.platform.startswith("win")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TYPE-SAFE CONFIG READERS
+# TYPE-SAFE READERS
 # ══════════════════════════════════════════════════════════════════════════════
 def _safe_int(v: Any, default: int,
               lo: Optional[int] = None, hi: Optional[int] = None) -> int:
@@ -113,7 +229,6 @@ def _safe_dict(v: Any) -> dict:
 
 
 def _cfg_get(cfg_obj: Any, section: str, key: str, default: Any) -> Any:
-    """Read cfg.<section>[key] with full type safety."""
     try:
         d = getattr(cfg_obj, section, None)
         if callable(d):
@@ -139,7 +254,6 @@ class Item:
 # EXTRACTION
 # ══════════════════════════════════════════════════════════════════════════════
 def extract(html: str) -> tuple[str, list[str], str]:
-    """Return (text, paragraphs, title). Never raises."""
     if not html:
         return "", [], ""
     parser = None
@@ -201,10 +315,9 @@ class SessionPool:
     """
     One AsyncSession per impersonate target.
 
-    Note: curl_cffi's AsyncSession does NOT accept `impersonate` in its
-    constructor on any released version. Impersonation is passed per-request.
-    This pool simply ensures separate cookie jars and connection pools per
-    fingerprint identity.
+    curl_cffi does not accept `impersonate` in the constructor; impersonation
+    is per-request. The pool keys by impersonate string so cookie jars and
+    connection pools stay separate per identity.
     """
 
     def __init__(self, max_clients: int = 64):
@@ -213,7 +326,7 @@ class SessionPool:
         self._lock = asyncio.Lock()
 
     async def get(self, impersonate: str) -> AsyncSession:
-        key = impersonate or "chrome"
+        key = impersonate or "default"
         async with self._lock:
             s = self._sessions.get(key)
             if s is None:
@@ -237,11 +350,8 @@ class Engine:
     def __init__(self, config_path: str = "config.json", base_dir: str = "."):
         self.config = Config(config_path)
 
-        # Platform policy first — sets nice, scheduler, mallopt
         try:
-            raw = getattr(self.config, "raw", None) or getattr(
-                self.config, "_raw", None) or {}
-            Platform.apply_runtime_policy(raw if isinstance(raw, dict) else {})
+            Platform.apply_runtime_policy(self.config.raw)
         except Exception as e:
             log.debug("platform policy skipped: %s", e)
 
@@ -250,17 +360,12 @@ class Engine:
         except Exception:
             pass
 
-        # Subsystems
         self.folders = Folders(base_dir, self.config)
         self.resume = Resume(base_dir, self.config)
         self.writer = Writer(self.folders, self.config)
         self.health = Health(self.config)
 
-        # Concurrency / runtime config (all reads type-safe)
-        initial = _safe_int(_cfg_get(self.config, "runtime", "concurrency", {}),
-                            0) if False else 0
-        conc_cfg = _cfg_get(self.config, "runtime", "concurrency", {})
-        conc_cfg = _safe_dict(conc_cfg)
+        conc_cfg = _safe_dict(_cfg_get(self.config, "runtime", "concurrency", {}))
         initial = _safe_int(conc_cfg.get("initial", 128), 128, lo=1, hi=8192)
         cmin = _safe_int(conc_cfg.get("min", 16), 16, lo=1, hi=8192)
         cmax = _safe_int(conc_cfg.get("max", 1024), 1024, lo=cmin, hi=16384)
@@ -306,18 +411,48 @@ class Engine:
             30.0, lo=5.0, hi=600.0)
         self._trim_last = time.time()
 
+        # Diagnostics
+        self._fail_reasons: Counter[str] = Counter()
+
         self._log_cfg_summary()
 
-    # ── helpers ──────────────────────────────────────────────────────────────
+    # ── diagnostics ──────────────────────────────────────────────────────────
     def _log_cfg_summary(self):
         try:
+            sites = len(self.config.site_names())
+            agents = len(self.config.agent_names())
             log.info("config: %d sites, %d agents, resume known=%d",
-                     len(self.config.site_names()),
-                     len(self.config.agent_names()),
-                     len(self.resume.known))
-        except Exception:
-            pass
+                     sites, agents, len(self.resume.known))
+            if _SUPPORTED_IMPERSONATES:
+                log.info("curl_cffi: %d supported impersonate targets "
+                         "(e.g. %s)",
+                         len(_SUPPORTED_IMPERSONATES),
+                         ", ".join(sorted(_SUPPORTED_IMPERSONATES)[:5]))
+            else:
+                log.warning("curl_cffi: could not enumerate impersonate "
+                            "targets; passing config values through as-is")
+            # Warn about config agents whose impersonate will be substituted
+            substituted = {}
+            for name in self.config.agent_names():
+                try:
+                    agent = self.config._agents[name]
+                except Exception:
+                    continue
+                requested = agent.get("impersonate", "")
+                if not requested:
+                    continue
+                actual = _resolve_impersonate(requested)
+                if actual != requested:
+                    substituted[requested] = actual
+            if substituted:
+                log.warning(
+                    "impersonate substitutions in effect (%d): %s",
+                    len(substituted),
+                    ", ".join(f"{k}→{v}" for k, v in list(substituted.items())[:6]))
+        except Exception as e:
+            log.debug("cfg summary failed: %s", e)
 
+    # ── helpers ──────────────────────────────────────────────────────────────
     def _bucket(self, domain: str) -> TokenBucket:
         b = self._buckets.get(domain)
         if b is None:
@@ -331,8 +466,6 @@ class Engine:
         return b
 
     def _pick_agent_for(self, item: Item) -> str:
-        """First attempt uses config-specified agent. Retries rotate through
-        the health.probe_agents_order fallback list."""
         if item.attempt <= 0:
             try:
                 return self.config.agent_for(item.domain)
@@ -349,9 +482,11 @@ class Engine:
         except Exception:
             return "chrome146_win"
 
-    def _record_fail(self, domain: str):
+    def _record_fail(self, domain: str, reason: str = ""):
         self.fail += 1
         self._push_recent(0)
+        if reason:
+            self._fail_reasons[reason.split(":", 1)[0]] += 1
 
     def _record_ok(self, domain: str):
         self.success += 1
@@ -365,9 +500,8 @@ class Engine:
             self._recent[self._recent_head] = v
             self._recent_head = (self._recent_head + 1) % self._recent_cap
 
-    # ── signal wiring ────────────────────────────────────────────────────────
+    # ── signals ──────────────────────────────────────────────────────────────
     def _install_signals(self):
-        """Signal handlers only on Unix; Windows relies on KeyboardInterrupt."""
         if _IS_WINDOWS:
             return
         try:
@@ -395,27 +529,37 @@ class Engine:
         agent_name = self._pick_agent_for(item)
         try:
             resolved = self.config.resolve_agent(agent_name)
-        except Exception:
-            resolved = {
-                "impersonate": "chrome146",
-                "headers": {"User-Agent": "Mozilla/5.0"},
-            }
+        except Exception as e:
+            log.warning("agent resolve failed %s: %s", agent_name, e)
+            self._record_fail(domain, "agent_resolve")
+            return None
 
-        impersonate = resolved.get("impersonate") or "chrome146"
+        raw_impersonate = resolved.get("impersonate") or ""
+        impersonate = _resolve_impersonate(raw_impersonate)
         headers = resolved.get("headers") or {}
+
+        # Ensure User-Agent matches the impersonate if it was substituted
+        if impersonate != raw_impersonate and headers.get("User-Agent"):
+            # Header/UA mismatch would be a red flag to WAFs. Drop UA override
+            # so curl_cffi's impersonation provides its own.
+            headers = dict(headers)
+            headers.pop("User-Agent", None)
 
         await self._bucket(domain).take(1.0)
 
         try:
             session = await self._sessions.get(impersonate)
-        except Exception:
-            self._record_fail(domain)
+        except Exception as e:
+            log.warning("session get failed: %s", e)
+            self._record_fail(domain, "session")
             return None
 
         timeout_s = _safe_float(
             _cfg_get(self.config, "runtime", "timeout_seconds", 15.0),
             15.0, lo=1.0, hi=120.0)
 
+        # ── the actual request ───────────────────────────────────────────────
+        r = None
         try:
             r = await asyncio.wait_for(
                 session.get(
@@ -428,15 +572,43 @@ class Engine:
                 timeout=timeout_s + 5.0,
             )
         except Exception as e:
-            log.debug("fetch error %s: %s", item.url, e)
-            self._record_fail(domain)
-            try:
-                self.health.mark_unreachable(domain)
-            except Exception:
-                pass
-            return None
+            err_str = str(e)
+            err_low = err_str.lower()
+            # Bad impersonate → retry without fingerprint
+            if ("impersonate" in err_low or "unknown" in err_low
+                    or "not supported" in err_low):
+                log.warning(
+                    "impersonate '%s' rejected by curl_cffi (%s); "
+                    "retrying without fingerprint for %s",
+                    impersonate, err_str[:120], item.url)
+                try:
+                    r = await asyncio.wait_for(
+                        session.get(
+                            item.url,
+                            headers=headers,
+                            timeout=timeout_s,
+                            allow_redirects=True,
+                        ),
+                        timeout=timeout_s + 5.0,
+                    )
+                except Exception as e2:
+                    log.warning("fetch failed %s: %s", item.url, e2)
+                    self.health.record_fetch_error(domain, f"fetch:{type(e2).__name__}")
+                    self._record_fail(domain, f"fetch:{type(e2).__name__}")
+                    return None
+            else:
+                log.warning("fetch failed %s [%s]: %s",
+                            item.url, type(e).__name__, err_str[:160])
+                self.health.record_fetch_error(domain, f"fetch:{type(e).__name__}")
+                self._record_fail(domain, f"fetch:{type(e).__name__}")
+                return None
 
-        # content-type gate
+        # ── from here, r is not None ─────────────────────────────────────────
+        try:
+            status = int(r.status_code)
+        except Exception:
+            status = 0
+
         try:
             ctype = (r.headers.get("content-type") or "").lower()
         except Exception:
@@ -447,52 +619,39 @@ class Engine:
 
         body = r.text or ""
 
-        # hard block signals
-        if r.status_code in (403, 429, 503) or r.status_code >= 500:
-            try:
-                reason = self.health.detect_block(body) or f"http_{r.status_code}"
-            except Exception:
-                reason = f"http_{r.status_code}"
-            try:
-                self.health.mark_block(domain)
-            except Exception:
-                pass
-            self._record_fail(domain)
+        # ── block detection ──────────────────────────────────────────────────
+        reason = self.health.detect_block(body, status_code=status)
+        if reason:
+            log.warning("blocked %s [%d] %s", item.url, status, reason)
+            self.health.mark_block(domain, reason=reason)
+            self._record_fail(domain, f"block:{reason.split(':', 1)[0]}")
             try:
                 await self.config.record_failure(domain, agent_name)
             except Exception:
                 pass
-            log.debug("block %s: %s", domain, reason)
             return None
 
-        if r.status_code >= 400:
-            self._record_fail(domain)
+        # ── hard failures ────────────────────────────────────────────────────
+        if status in (403, 429, 503) or status >= 500:
+            log.warning("http %d %s", status, item.url)
+            self.health.mark_block(domain, reason=f"status_{status}")
+            self._record_fail(domain, f"http:{status}")
             try:
-                self.health.mark_unreachable(domain)
+                await self.config.record_failure(domain, agent_name)
             except Exception:
                 pass
+            return None
+
+        if status >= 400:
+            log.warning("http %d %s", status, item.url)
+            self.health.record_fetch_error(domain, f"http_{status}")
+            self._record_fail(domain, f"http:{status}")
             return None
 
         if not body:
-            self._record_fail(domain)
-            return None
-
-        # soft block (body-level detection)
-        try:
-            detected = self.health.detect_block(body)
-        except Exception:
-            detected = None
-        if detected:
-            try:
-                self.health.mark_block(domain)
-            except Exception:
-                pass
-            self._record_fail(domain)
-            try:
-                await self.config.record_failure(domain, agent_name)
-            except Exception:
-                pass
-            log.debug("soft block %s: %s", domain, detected)
+            log.warning("empty body %s [%d]", item.url, status)
+            self.health.record_fetch_error(domain, "empty_body")
+            self._record_fail(domain, "empty_body")
             return None
 
         try:
@@ -503,7 +662,6 @@ class Engine:
 
     # ── process ──────────────────────────────────────────────────────────────
     async def _process(self, item: Item):
-        # Resume cache check
         try:
             if self.resume.is_known(item.url):
                 self.skipped += 1
@@ -529,8 +687,8 @@ class Engine:
         try:
             text, paragraphs, title = extract(html)
         except Exception as e:
-            log.debug("parse fail %s: %s", item.url, e)
-            self._record_fail(item.domain)
+            log.warning("parse fail %s: %s", item.url, e)
+            self._record_fail(item.domain, "parse")
             return
 
         record = build_record(item.url, title, text, paragraphs,
@@ -539,8 +697,8 @@ class Engine:
         try:
             await self.writer.write(record)
         except Exception as e:
-            log.debug("writer fail %s: %s", item.url, e)
-            self._record_fail(item.domain)
+            log.warning("writer fail %s: %s", item.url, e)
+            self._record_fail(item.domain, "writer")
             return
 
         try:
@@ -556,14 +714,12 @@ class Engine:
         self._record_ok(item.domain)
         self.bytes_out += len(text.encode("utf-8", errors="ignore"))
 
-        # Feed crawler
         if self._crawler is not None:
             try:
                 self._crawler.inject(html, item.url, item.depth)
             except Exception as e:
                 log.debug("crawler inject fail %s: %s", item.url, e)
 
-        # GC / trim
         self._gc_counter += 1
         if self._gc_counter >= self._gc_every:
             try:
@@ -593,22 +749,14 @@ class Engine:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            log.debug("task error %s: %s", item.url, e)
+            log.warning("task error %s: %s", item.url, e)
         finally:
             self._inflight -= 1
 
     # ── scheduler ────────────────────────────────────────────────────────────
     async def _scheduler(self):
-        """
-        Single source of work dispatch. Priority:
-            1. Retry queue (_pending).
-            2. Crawler frontier.
-        When neither has work, sleeps 50ms. Never exits on its own — the
-        run loop decides when work is fully drained.
-        """
         while not self._shutdown.is_set():
             item: Optional[Item] = None
-
             try:
                 item = self._pending.get_nowait()
             except asyncio.QueueEmpty:
@@ -719,6 +867,7 @@ class Engine:
                 for d in stale[:50]:
                     try:
                         self.health.state(d).status = "UNKNOWN"
+                        self.health.state(d).consec_fail = 0
                     except Exception:
                         pass
 
@@ -743,13 +892,11 @@ class Engine:
     async def run(self, seed_urls: list[str]):
         self._install_signals()
 
-        # ── seed ─────────────────────────────────────────────────────────────
         cleaned = [u for u in (normalize_url(u) for u in seed_urls) if u]
         if not cleaned:
             log.warning("no valid seed URLs")
             return
 
-        # First seed anchors the crawler (which itself seeds its frontier).
         if self._crawler is None:
             try:
                 self._crawler = Crawler(self.config, cleaned[0])
@@ -757,14 +904,12 @@ class Engine:
                 log.warning("crawler init failed: %s", e)
                 self._crawler = None
 
-        # Extra seeds go through the retry queue so they get dispatched too.
         for u in cleaned[1:]:
             try:
                 self._pending.put_nowait(Item(u, urlparse(u).netloc, 0))
             except asyncio.QueueFull:
                 log.warning("queue full at seed; dropping %s", u)
 
-        # ── background loops ─────────────────────────────────────────────────
         loops = [
             asyncio.create_task(self._scheduler(), name="scheduler"),
             asyncio.create_task(self._adaptive_loop(), name="adaptive"),
@@ -773,19 +918,17 @@ class Engine:
             asyncio.create_task(self._health_loop(), name="health"),
         ]
 
-        # ── main wait ────────────────────────────────────────────────────────
         idle_streak = 0
         try:
             while not self._shutdown.is_set():
                 if self._is_idle():
                     idle_streak += 1
-                    if idle_streak >= 4:   # ~1s idle
+                    if idle_streak >= 8:   # ~2s idle
                         break
                 else:
                     idle_streak = 0
                 await asyncio.sleep(0.25)
         finally:
-            # ── shutdown ─────────────────────────────────────────────────────
             self._shutdown.set()
             for lp in loops:
                 lp.cancel()
@@ -864,6 +1007,10 @@ class Engine:
         log.info("  peak pps     : %.2f", m["peak_pps"])
         log.info("  data written : %.2f MB", m["data_size_mb"])
         log.info("  unique URLs  : %d", m["known_urls"])
+        if self._fail_reasons:
+            log.info("  failure reasons:")
+            for reason, count in self._fail_reasons.most_common(10):
+                log.info("      %-24s %d", reason, count)
         log.info("=" * 56)
 
 
@@ -874,7 +1021,6 @@ async def _run_terminal(engine: Engine, urls: list[str]):
     try:
         from tqdm import tqdm
     except Exception:
-        # Fallback: no tqdm, just run
         await engine.run(urls)
         return
 
@@ -918,7 +1064,7 @@ async def _run_terminal(engine: Engine, urls: list[str]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOGGING
+# LOGGING + CLI
 # ══════════════════════════════════════════════════════════════════════════════
 def _configure_logging():
     try:
@@ -927,13 +1073,13 @@ def _configure_logging():
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%H:%M:%S",
         )
+        # Keep third-party libs quieter unless explicitly needed
+        logging.getLogger("curl_cffi").setLevel(logging.WARNING)
+        logging.getLogger("asyncio").setLevel(logging.WARNING)
     except Exception:
         pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CLI
-# ══════════════════════════════════════════════════════════════════════════════
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="Fa_Scrap.py",
@@ -974,7 +1120,6 @@ def _config_path() -> str:
     candidate = here / "config.json"
     if candidate.exists():
         return str(candidate)
-    # Fall back to cwd
     cwd_candidate = Path.cwd() / "config.json"
     if cwd_candidate.exists():
         return str(cwd_candidate)
@@ -1010,13 +1155,11 @@ def _run_gui_mode(url: Optional[str]) -> int:
     except Exception as e:
         log.error("engine init failed: %s", e)
         return 1
-
     try:
         from Fa_FUI import launch
     except Exception as e:
         log.error("GUI unavailable (%s). Falling back to terminal.", e)
         return _run_terminal_mode(url)
-
     normalized = _normalize_seed(url) if url else ""
     autostart = bool(normalized)
     try:
@@ -1030,11 +1173,8 @@ def main() -> int:
     _configure_logging()
     parser = build_parser()
     args = parser.parse_args()
-
     if args.terminal:
         return _run_terminal_mode(args.url)
-
-    # Default: GUI (whether or not -G was passed explicitly)
     return _run_gui_mode(args.url)
 
 
