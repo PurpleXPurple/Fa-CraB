@@ -1414,6 +1414,13 @@
       "allow_external": false,
       "category": "travel",
       "retry_after": 1200
+    },
+    "en.wikipedia.org": {
+      "agent": "firefox147_win",
+      "rate": 2.0,
+      "allow_external": false,
+      "category": "learned",
+      "retry_after": 300
     }
   },
   "learned": {
@@ -1430,10 +1437,11 @@
       "agent": "firefox147_win",
       "rate": 2.0,
       "first_seen": 1791821786,
-      "ok": 0,
+      "ok": 274,
       "fail": 1,
-      "promoted": false,
-      "last_fail": 1791821786
+      "promoted": true,
+      "last_fail": 1791821786,
+      "last_ok": 1791822633
     }
   }
 }

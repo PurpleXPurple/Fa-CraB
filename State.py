@@ -2,15 +2,14 @@
 """
 State.py — Fa-Scrap substrate.
 
-Changes in this build:
-    - Health.detect_block() now takes a status code, splits patterns into
-      STRONG (only appear in real blocks) and WEAK (may appear normally),
-      and only fires on a real signal.
-    - Health.mark_block() and mark_unreachable() now require consecutive
-      failures before locking a domain out.
-    - DomainState tracks consecutive fails separately from total fails.
-    - Added Health.record_fetch_error() for one-off errors that shouldn't
-      trigger a lockout.
+Writer now emits ONE file per batch: <domain>_<idx>.json.zst
+    - Content: a JSON array of records.
+    - Compression: zstd level 22.
+    - No intermediate raw file, no ZIP wrapper.
+
+Resume now uses ONE file: resume.jsonl.gz
+    - Append-only gzip (multi-member) JSONL of {link, h}.
+    - Reads back transparently across members.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import gc
+import gzip
 import logging
 import os
 import platform as _pyplatform
@@ -27,9 +27,8 @@ import re
 import struct
 import sys
 import time
-import zipfile
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -43,7 +42,57 @@ log = logging.getLogger("fa.state")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLATFORM LAYER
+# REAL curl_cffi IMPERSONATE TARGETS
+# ══════════════════════════════════════════════════════════════════════════════
+REAL_IMPERSONATES = {
+    "chrome99", "chrome100", "chrome101", "chrome104", "chrome107",
+    "chrome110", "chrome116", "chrome119", "chrome120", "chrome123",
+    "chrome124", "chrome131", "chrome133a", "chrome136",
+    "chrome99_android", "chrome131_android",
+    "edge99", "edge101",
+    "safari153", "safari155", "safari170", "safari180", "safari184", "safari260",
+    "safari172_ios", "safari180_ios", "safari184_ios", "safari260_ios",
+    "firefox133",
+    "tor145",
+}
+
+ROTATION_ORDER = [
+    "chrome136", "chrome131", "chrome133a", "chrome124",
+    "safari184", "safari260", "safari180", "safari170",
+    "firefox133", "tor145",
+    "chrome131_android", "safari184_ios",
+    "edge101", "edge99",
+]
+
+
+def validate_impersonate(name: str) -> str:
+    if not name:
+        return "chrome136"
+    if name in REAL_IMPERSONATES:
+        return name
+    stripped = re.sub(r"_(win|mac|linux|android|ios|ipad)$", "", name)
+    for cand in (stripped, stripped.replace("firefox", "chrome")):
+        if cand in REAL_IMPERSONATES:
+            return cand
+    if name.startswith("chrome"):
+        return "chrome136"
+    if name.startswith("safari"):
+        return "safari184"
+    if name.startswith("firefox"):
+        return "firefox133"
+    return "chrome136"
+
+
+def rotate_impersonate(current: str = "") -> str:
+    if current in ROTATION_ORDER:
+        idx = (ROTATION_ORDER.index(current) + 1) % len(ROTATION_ORDER)
+    else:
+        idx = 0
+    return ROTATION_ORDER[idx]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLATFORM
 # ══════════════════════════════════════════════════════════════════════════════
 class Platform:
     _applied_once = False
@@ -58,17 +107,14 @@ class Platform:
         try:
             runtime = cfg.get("runtime", {}) if isinstance(cfg, dict) else {}
             pcfg = runtime.get("platform", {}) if isinstance(runtime, dict) else {}
-
             libc_path = ctypes.util.find_library("c")
             if not libc_path:
                 return
             libc = ctypes.CDLL(libc_path, use_errno=True)
-
             try:
                 libc.nice(int(pcfg.get("nice", 19)))
             except Exception:
                 pass
-
             try:
                 if pcfg.get("scheduler", "SCHED_IDLE") == "SCHED_IDLE":
                     param = struct.pack("i", 0)
@@ -76,7 +122,6 @@ class Platform:
                     libc.sched_setscheduler(0, 5, ctypes.byref(buf))
             except Exception:
                 pass
-
             try:
                 libc.mallopt(-8, int(pcfg.get("mallopt_arena_max", 2)))
             except Exception:
@@ -104,21 +149,6 @@ class Platform:
             gc.freeze()
         except AttributeError:
             pass
-
-    @staticmethod
-    def direct_write(path: str | Path, data: bytes) -> int:
-        try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-            try:
-                return os.write(fd, data)
-            finally:
-                os.close(fd)
-        except Exception:
-            try:
-                with open(path, "ab") as f:
-                    return f.write(data)
-            except Exception:
-                return 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -165,16 +195,6 @@ class Config:
         return v if isinstance(v, dict) else {}
 
     @property
-    def cookies(self) -> dict:
-        v = self._raw.get("cookies", {})
-        return v if isinstance(v, dict) else {}
-
-    @property
-    def legal(self) -> dict:
-        v = self._raw.get("legal", {})
-        return v if isinstance(v, dict) else {}
-
-    @property
     def block_patterns(self) -> list[str]:
         v = self._raw.get("block_patterns", [])
         return v if isinstance(v, list) else []
@@ -191,7 +211,7 @@ class Config:
         agent = self._agents.get(agent_name)
         if not agent:
             if not self._agents:
-                return {"ua": "", "impersonate": "", "headers": {}}
+                return {"ua": "", "impersonate": "chrome136", "headers": {}}
             agent_name = next(iter(self._agents))
             agent = self._agents[agent_name]
         profile_name = agent.get("profile", "chrome")
@@ -213,7 +233,7 @@ class Config:
         headers["User-Agent"] = agent.get("ua", "")
         resolved = {
             "ua": agent.get("ua", ""),
-            "impersonate": agent.get("impersonate", "chrome131"),
+            "impersonate": validate_impersonate(agent.get("impersonate", "")),
             "headers": headers,
         }
         self._resolved[agent_name] = resolved
@@ -231,15 +251,16 @@ class Config:
 
     def agent_for(self, domain: str) -> str:
         entry = self.site_entry(domain)
-        return entry.get("agent", "chrome146_win")
+        return entry.get("agent", "chrome136_win")
 
     def rate_for(self, domain: str) -> float:
         entry = self.site_entry(domain)
-        v = entry.get("rate", 2.0)
-        try:
-            return float(v)
-        except Exception:
-            return 2.0
+        if "rate" in entry:
+            try:
+                return float(entry["rate"])
+            except Exception:
+                pass
+        return 5.0
 
     def retry_after_for(self, domain: str) -> float:
         entry = self.site_entry(domain)
@@ -251,7 +272,9 @@ class Config:
 
     def allow_external_for(self, domain: str) -> bool:
         entry = self.site_entry(domain)
-        return bool(entry.get("allow_external", False))
+        if "allow_external" in entry:
+            return bool(entry["allow_external"])
+        return True
 
     def max_depth_for(self, domain: str) -> int:
         entry = self.site_entry(domain)
@@ -270,7 +293,7 @@ class Config:
             entry = self._learned.get(domain)
             now = int(time.time())
             if entry is None:
-                entry = {"agent": agent_name, "rate": 2.0,
+                entry = {"agent": agent_name, "rate": 5.0,
                          "first_seen": now, "ok": 0, "fail": 0,
                          "promoted": False}
                 self._learned[domain] = entry
@@ -282,8 +305,8 @@ class Config:
                 entry["promoted"] = True
                 self._sites[domain] = {
                     "agent": agent_name,
-                    "rate": entry.get("rate", 2.0),
-                    "allow_external": False,
+                    "rate": entry.get("rate", 5.0),
+                    "allow_external": True,
                     "category": "learned",
                     "retry_after": 300,
                 }
@@ -294,7 +317,7 @@ class Config:
         async with self._lock:
             entry = self._learned.get(domain)
             if entry is None:
-                entry = {"agent": agent_name, "rate": 2.0,
+                entry = {"agent": agent_name, "rate": 5.0,
                          "first_seen": int(time.time()), "ok": 0, "fail": 0,
                          "promoted": False}
                 self._learned[domain] = entry
@@ -345,71 +368,54 @@ class Folders:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# RESUME
+# RESUME — single gzip-compressed append-only JSONL file
 # ══════════════════════════════════════════════════════════════════════════════
 class Resume:
+    """
+    File: resume/resume.jsonl.gz
+
+    One file. Gzip-compressed. Append-only via multi-member gzip streams
+    (Python's gzip module reads across members transparently).
+
+    Each line: {"link": "https://...", "h": 12345678901234567890}
+    """
+
     def __init__(self, base: str | Path, cfg: Config):
         s = cfg.storage
         self.base = Path(base)
         self.resume_dir = self.base / s.get("resume_dir", "resume")
         self.resume_dir.mkdir(parents=True, exist_ok=True)
-        self.jsonl = self.resume_dir / s.get("resume_jsonl", "resume.jsonl")
-        self.zst = self.resume_dir / s.get("resume_zst", "resume.jsonl.zst")
-        self.zip = self.resume_dir / s.get("resume_zip", "resume.zip")
+        # Single file name. Falls back to old default if not in config.
+        self.path = self.resume_dir / s.get("resume_file", "resume.jsonl.gz")
         self.known: set[int] = set()
-        self._pending: list[bytes] = []
+        self._pending: list[tuple[str, int]] = []
         self._lock = asyncio.Lock()
         self._load()
 
     def _load(self):
-        if self.jsonl.exists():
-            try:
-                with open(self.jsonl, "rb") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = orjson.loads(line)
-                            h = rec.get("hash_int")
-                            if h is None:
-                                url = rec.get("link", "")
-                                h = xxhash.xxh3_64_intdigest(url.encode("utf-8"))
-                            self.known.add(int(h))
-                        except Exception:
-                            continue
-                log.info("resume: loaded %d known URLs from jsonl", len(self.known))
-                return
-            except Exception as e:
-                log.warning("resume jsonl read failed: %s", e)
-        if self.zip.exists():
-            try:
-                self._load_from_zip()
-                log.info("resume: loaded %d known URLs from zip", len(self.known))
-            except Exception as e:
-                log.warning("resume zip read failed: %s", e)
-
-    def _load_from_zip(self):
-        with zipfile.ZipFile(self.zip, "r") as zf:
-            for name in zf.namelist():
-                raw = zf.read(name)
-                try:
-                    data = zstd.ZstdDecompressor().decompress(raw)
-                except Exception:
-                    continue
-                for line in data.split(b"\n"):
+        if not self.path.exists():
+            return
+        try:
+            count = 0
+            with gzip.open(self.path, "rt", encoding="utf-8") as f:
+                for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         rec = orjson.loads(line)
-                        h = rec.get("hash_int")
+                        h = rec.get("h")
                         if h is None:
                             url = rec.get("link", "")
                             h = xxhash.xxh3_64_intdigest(url.encode("utf-8"))
                         self.known.add(int(h))
+                        count += 1
                     except Exception:
                         continue
+            log.info("resume: loaded %d known URLs from %s",
+                     count, self.path.name)
+        except Exception as e:
+            log.warning("resume load failed: %s", e)
 
     def is_known(self, url: str) -> bool:
         h = xxhash.xxh3_64_intdigest(url.encode("utf-8"))
@@ -420,7 +426,7 @@ class Resume:
         if h in self.known:
             return
         self.known.add(h)
-        self._pending.append(orjson.dumps({"link": url, "hash_int": h}))
+        self._pending.append((url, h))
         if len(self._pending) >= 100:
             await self.flush()
 
@@ -428,51 +434,38 @@ class Resume:
         async with self._lock:
             if not self._pending:
                 return
-            payload = b"\n".join(self._pending) + b"\n"
+            lines = [orjson.dumps({"link": url, "h": h}).decode("utf-8")
+                     for url, h in self._pending]
             self._pending.clear()
-            Platform.direct_write(self.jsonl, payload)
-
-    async def snapshot(self):
-        async with self._lock:
-            await self.flush()
-            if not self.jsonl.exists():
-                return
+            payload = ("\n".join(lines) + "\n").encode("utf-8")
             try:
-                raw = self.jsonl.read_bytes()
-                compressed = zstd.ZstdCompressor(level=22).compress(raw)
-                self.zst.write_bytes(compressed)
-                with zipfile.ZipFile(self.zip, "w",
-                                     compression=zipfile.ZIP_DEFLATED) as zf:
-                    zf.writestr("resume.jsonl.zst", compressed)
+                # Append new gzip member; read side stitches members together
+                with gzip.open(self.path, "ab") as f:
+                    f.write(payload)
             except Exception as e:
-                log.warning("resume snapshot failed: %s", e)
+                log.warning("resume flush failed: %s", e)
 
     async def load_external(self, path: str | Path) -> int:
+        """Import another resume.jsonl.gz and return count added."""
         p = Path(path)
         if not p.exists():
             return 0
         before = len(self.known)
         try:
-            with zipfile.ZipFile(p, "r") as zf:
-                for name in zf.namelist():
-                    raw = zf.read(name)
+            with gzip.open(p, "rt", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
                     try:
-                        data = zstd.ZstdDecompressor().decompress(raw)
+                        rec = orjson.loads(line)
+                        h = rec.get("h")
+                        if h is None:
+                            url = rec.get("link", "")
+                            h = xxhash.xxh3_64_intdigest(url.encode("utf-8"))
+                        self.known.add(int(h))
                     except Exception:
-                        data = raw
-                    for line in data.split(b"\n"):
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            rec = orjson.loads(line)
-                            h = rec.get("hash_int")
-                            if h is None:
-                                url = rec.get("link", "")
-                                h = xxhash.xxh3_64_intdigest(url.encode("utf-8"))
-                            self.known.add(int(h))
-                        except Exception:
-                            continue
+                        continue
         except Exception as e:
             log.warning("external resume load failed: %s", e)
             return 0
@@ -480,15 +473,23 @@ class Resume:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WRITER
+# WRITER — single JSON-array file per batch, zstd compressed
 # ══════════════════════════════════════════════════════════════════════════════
 class Writer:
+    """
+    Emits ONE file per batch: <domain>_<idx>.json.zst
+
+    Content: JSON array [ {...}, {...}, ... ]
+    Compression: zstd level 22
+    No raw intermediate, no ZIP wrapper.
+    """
+
     def __init__(self, folders: Folders, cfg: Config):
         self.folders = folders
         self.cfg = cfg
         self.max_lines = int(cfg.storage.get("max_lines_per_file", 900))
         self.zstd_level = int(cfg.storage.get("zstd_level", 22))
-        self.buffers: dict[str, list[bytes]] = {}
+        self.buffers: dict[str, list[dict]] = {}
         self.counters: dict[str, int] = {}
         self.total_written = 0
         self._lock = asyncio.Lock()
@@ -497,7 +498,7 @@ class Writer:
         domain = record.get("domain", "unknown")
         async with self._lock:
             buf = self.buffers.setdefault(domain, [])
-            buf.append(orjson.dumps(record))
+            buf.append(record)
             self.total_written += 1
             if len(buf) >= self.max_lines:
                 await self._flush_domain_locked(domain)
@@ -514,64 +515,42 @@ class Writer:
         self.buffers[domain] = []
         idx = self.counters.get(domain, 0)
         self.counters[domain] = idx + 1
+
         ddir = self.folders.domain_dir(domain)
-        base_name = f"{domain.replace('.', '_')}_{idx:05d}.jsonl"
-        jsonl_path = ddir / base_name
-        zst_path = jsonl_path.with_suffix(".jsonl.zst")
-        zip_path = jsonl_path.with_suffix(".jsonl.zst.zip")
-        payload = b"\n".join(buf) + b"\n"
+        safe = domain.replace(".", "_")
+        out_path = ddir / f"{safe}_{idx:05d}.json.zst"
+
         try:
-            Platform.direct_write(jsonl_path, payload)
-            compressed = zstd.ZstdCompressor(level=self.zstd_level).compress(payload)
-            zst_path.write_bytes(compressed)
-            with zipfile.ZipFile(zip_path, "w",
-                                 compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr(base_name + ".zst", compressed)
+            payload = orjson.dumps(buf)  # JSON array
+            compressed = zstd.ZstdCompressor(
+                level=self.zstd_level).compress(payload)
+            out_path.write_bytes(compressed)
+            log.debug("wrote %s (%d records, %d bytes compressed)",
+                      out_path.name, len(buf), len(compressed))
             gc.collect()
         except Exception as e:
             log.warning("writer flush failed for %s: %s", domain, e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HEALTH  — REWRITTEN
+# HEALTH
 # ══════════════════════════════════════════════════════════════════════════════
-# STRONG patterns: these only appear in real challenge/block pages.
 _STRONG_BLOCK_PATTERNS = [
-    "cf-browser-verification",
-    "cf_chl_opt",
-    "cf-please-wait",
-    "challenge-platform",
-    "checking your browser before accessing",
+    "cf-browser-verification", "cf_chl_opt", "cf-please-wait",
+    "challenge-platform", "checking your browser before accessing",
     "enable javascript and cookies to continue",
-    "ddos protection by cloudflare",
-    "please wait while we verify",
-    "attention required! | cloudflare",
-    "datadome",
-    "perimeterx",
-    "px-captcha",
-    "kasada",
-    "incapsula incident id",
-    "_incapsula_",
-    "are you a robot",
-    "verify you are human",
-    "access denied | cloudflare",
+    "ddos protection by cloudflare", "please wait while we verify",
+    "attention required! | cloudflare", "datadome", "perimeterx",
+    "px-captcha", "kasada", "incapsula incident id", "_incapsula_",
+    "are you a robot", "verify you are human", "access denied | cloudflare",
 ]
 
-# WEAK patterns: only fire when status code is suspicious AND body is tiny.
 _WEAK_BLOCK_PATTERNS = [
-    "just a moment",
-    "ddos protection",
-    "ray id",
-    "cloudflare",
-    "captcha",
-    "bot detection",
-    "unusual traffic",
+    "just a moment", "ddos protection", "ray id", "cloudflare",
+    "captcha", "bot detection", "unusual traffic",
 ]
 
-# Status codes that on their own suggest a block (not just an error).
 _BLOCK_STATUS = frozenset({403, 429, 503})
-
-# Minimum consecutive failures before locking a domain.
 _BLOCK_THRESHOLD = 3
 _UNREACHABLE_THRESHOLD = 5
 
@@ -585,7 +564,7 @@ class DomainState:
     ok_count: int = 0
     last_seen: float = 0.0
     retry_at: float = 0.0
-    agent: str = "chrome146_win"
+    agent: str = "chrome136_win"
     last_reason: str = ""
 
 
@@ -595,12 +574,10 @@ class Health:
         self.states: dict[str, DomainState] = {}
         self._strong_re = re.compile(
             "|".join(re.escape(p) for p in _STRONG_BLOCK_PATTERNS),
-            re.IGNORECASE,
-        )
+            re.IGNORECASE)
         self._weak_re = re.compile(
             "|".join(re.escape(p) for p in _WEAK_BLOCK_PATTERNS),
-            re.IGNORECASE,
-        )
+            re.IGNORECASE)
 
     def state(self, domain: str) -> DomainState:
         s = self.states.get(domain)
@@ -619,7 +596,6 @@ class Health:
         s.last_reason = ""
 
     def mark_block(self, domain: str, reason: str = ""):
-        """Increment fail. Only flip to BLOCKED after _BLOCK_THRESHOLD."""
         s = self.state(domain)
         s.fail_count += 1
         s.consec_fail += 1
@@ -628,12 +604,8 @@ class Health:
         if s.consec_fail >= _BLOCK_THRESHOLD:
             s.status = "BLOCKED"
             s.retry_at = time.time() + self.cfg.retry_after_for(domain)
-        max_fails = int(self.cfg.health_cfg.get("dead_after_failures", 25))
-        if s.fail_count >= max_fails:
-            s.status = "DEAD"
 
     def mark_unreachable(self, domain: str, reason: str = ""):
-        """Increment fail. Only flip to UNREACHABLE after _UNREACHABLE_THRESHOLD."""
         s = self.state(domain)
         s.fail_count += 1
         s.consec_fail += 1
@@ -646,7 +618,6 @@ class Health:
             s.retry_at = time.time() + delay
 
     def record_fetch_error(self, domain: str, reason: str = ""):
-        """One-off error: bump counters but do NOT change status."""
         s = self.state(domain)
         s.fail_count += 1
         s.consec_fail += 1
@@ -667,39 +638,24 @@ class Health:
             return False
         return True
 
-    def detect_block(self, body: str,
-                     status_code: int = 200) -> Optional[str]:
-        """
-        Return a block reason string, or None.
-
-        Logic:
-            - Strong pattern in first 16 KB → block (with reason tag).
-            - Else if status is 403/429/503 AND weak pattern → block.
-            - Else if body < 20000 chars AND weak pattern → block.
-            - Else → None.
-        """
+    def detect_block(self, body: str, status_code: int = 200) -> Optional[str]:
         if not body:
-            # If body empty and status suggests a block, still flag it.
             if status_code in _BLOCK_STATUS:
                 return f"status_{status_code}_empty"
             return None
         sample = body[:16384]
-
         m = self._strong_re.search(sample)
         if m:
             return f"strong:{m.group(0)[:40]}"
-
         if status_code in _BLOCK_STATUS:
             m = self._weak_re.search(sample)
             if m:
                 return f"weak+{status_code}:{m.group(0)[:40]}"
             return f"status_{status_code}"
-
         if len(body) < 20000:
             m = self._weak_re.search(sample)
             if m:
                 return f"weak+small:{m.group(0)[:40]}"
-
         return None
 
 
@@ -710,14 +666,15 @@ class TokenBucket:
     __slots__ = ("rate", "burst", "tokens", "last")
     def __init__(self, rate: float, burst: float | None = None):
         self.rate = float(rate)
-        self.burst = float(burst if burst is not None else max(1.0, rate))
+        self.burst = float(burst if burst is not None else max(1.0, rate * 2))
         self.tokens = self.burst
         self.last = time.monotonic()
 
     async def take(self, n: float = 1.0):
         while True:
             now = time.monotonic()
-            self.tokens = min(self.burst, self.tokens + (now - self.last) * self.rate)
+            self.tokens = min(self.burst,
+                              self.tokens + (now - self.last) * self.rate)
             self.last = now
             if self.tokens >= n:
                 self.tokens -= n
@@ -809,8 +766,7 @@ def normalize_url(url: str) -> str:
 def main():
     p = argparse.ArgumentParser(
         prog="State.py",
-        description="Fa-Scrap substrate. Import this module. CLI is --help only.",
-    )
+        description="Fa-Scrap substrate. Import this module. CLI is --help only.")
     p.print_help()
 
 

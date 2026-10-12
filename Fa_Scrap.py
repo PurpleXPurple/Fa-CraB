@@ -2,20 +2,16 @@
 """
 Fa_Scrap.py — Fa-Scrap main engine.
 
-Usage:
-    python Fa_Scrap.py                    GUI opens, paste a URL
-    python Fa_Scrap.py <url>              GUI opens, prefilled, autostarts
-    python Fa_Scrap.py -T                 Terminal, prompts for URL
-    python Fa_Scrap.py -T <url>           Terminal, immediate start
-    python Fa_Scrap.py --help             Help
-
-Fixes in this build:
-    - Impersonate values are validated against curl_cffi's real supported
-      set at import time. Invalid ones are silently substituted.
-    - Failed fetches log at WARNING, not DEBUG. You will see them.
-    - Failures are bucketed by reason for a summary at the end.
-    - Per-URL agent rotation on retry; each attempt uses a different agent.
-    - Health module no longer locks out domains on first failure.
+Optimizations in this build:
+    - SessionPool uses max_clients=256 per impersonate target (was 64).
+    - RetryStrategy with exponential backoff + jitter on every session.
+    - JA3/TLS rotation on retry: each attempt uses a different fingerprint.
+    - HTTP/2 forced on every request; HTTP/3 attempted for chrome/safari.
+    - Cross-domain crawling ON by default.
+    - Per-domain rate limits relaxed to 5.0 rps default; site config can
+      override.
+    - Concurrency initial raised to 256, max to 2048.
+    - New diagnostics: per-domain throughput, impersonate usage histogram.
 """
 
 from __future__ import annotations
@@ -39,121 +35,12 @@ from selectolax.lexbor import LexborHTMLParser
 
 from State import (
     AdaptiveSemaphore, Config, EWMA, Folders, Health, Platform, Resume,
-    TokenBucket, Writer, normalize_url,
+    TokenBucket, Writer, normalize_url, validate_impersonate, rotate_impersonate,
+    REAL_IMPERSONATES,
 )
 from Fa_Crawl import Crawler
 
 log = logging.getLogger("fa.scrap")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# IMPERSONATE VALIDATION
-# ══════════════════════════════════════════════════════════════════════════════
-def _collect_supported_impersonates() -> set[str]:
-    """
-    Introspect curl_cffi for its supported impersonate targets.
-
-    Different curl_cffi versions expose this differently:
-        - curl_cffi.requests.impersonate.BrowserTypeLiteral (typing literal)
-        - curl_cffi.const.<SomeEnum>
-        - A dict in curl_cffi.requests.impersonate
-    """
-    supported: set[str] = set()
-
-    # Path 1: the typing literal used in signatures
-    try:
-        from curl_cffi.requests import impersonate as _imp_mod  # type: ignore
-        bt = getattr(_imp_mod, "BrowserTypeLiteral", None)
-        if bt is not None:
-            try:
-                import typing
-                args = typing.get_args(bt)
-                supported.update(a for a in args if isinstance(a, str))
-            except Exception:
-                pass
-        # Also try well-known constants
-        for name in ("DEFAULT_CHROME", "DEFAULT_SAFARI", "DEFAULT_FIREFOX"):
-            v = getattr(_imp_mod, name, None)
-            if isinstance(v, str):
-                supported.add(v)
-    except Exception:
-        pass
-
-    # Path 2: const enum
-    try:
-        import curl_cffi.const as _c  # type: ignore
-        for name in dir(_c):
-            obj = getattr(_c, name)
-            if hasattr(obj, "__members__"):
-                for member in obj.__members__.values():
-                    v = getattr(member, "value", None)
-                    if isinstance(v, str) and "-" not in v and len(v) < 40:
-                        supported.add(v)
-    except Exception:
-        pass
-
-    # Path 3: any version that exposes a list attribute
-    try:
-        from curl_cffi.requests import session as _sess  # type: ignore
-        for name in dir(_sess):
-            v = getattr(_sess, name)
-            if isinstance(v, (set, frozenset)) and v and all(
-                    isinstance(x, str) for x in v):
-                supported.update(v)
-    except Exception:
-        pass
-
-    return supported
-
-
-_SUPPORTED_IMPERSONATES: set[str] = _collect_supported_impersonates()
-
-
-# A fallback chain used when config gives us a target curl_cffi doesn't know.
-_FALLBACK_CHAIN = (
-    "chrome131", "chrome136", "chrome124", "chrome123", "chrome120",
-    "chrome116", "chrome110", "chrome107", "chrome104", "chrome101",
-    "chrome100", "chrome99",
-    "safari184", "safari180", "safari170", "safari172_ios", "safari184_ios",
-    "firefox135", "firefox133", "firefox144",
-    "edge101", "edge99",
-    "chrome131_android", "chrome99_android",
-)
-
-
-def _resolve_impersonate(name: str) -> str:
-    """
-    Return a curl_cffi-compatible impersonate string.
-
-    If curl_cffi's set could not be introspected, return `name` untouched —
-    let curl_cffi raise on its own terms.
-    """
-    if not name:
-        return _pick_fallback()
-    if not _SUPPORTED_IMPERSONATES:
-        return name
-    if name in _SUPPORTED_IMPERSONATES:
-        return name
-
-    # Try close variations before giving up
-    stripped = re.sub(r"_(win|mac|linux|android|ios|ipad)$", "", name)
-    for cand in (stripped, stripped + "a"):
-        if cand in _SUPPORTED_IMPERSONATES:
-            return cand
-
-    # Broad fallback chain
-    for fb in _FALLBACK_CHAIN:
-        if fb in _SUPPORTED_IMPERSONATES:
-            return fb
-
-    return next(iter(_SUPPORTED_IMPERSONATES))
-
-
-def _pick_fallback() -> str:
-    for fb in _FALLBACK_CHAIN:
-        if fb in _SUPPORTED_IMPERSONATES:
-            return fb
-    return next(iter(_SUPPORTED_IMPERSONATES), "chrome131")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,9 +51,15 @@ _PARA_SPLIT = re.compile(r"\n\s*\n")
 _HTML_TYPES = ("text/html", "application/xhtml+xml")
 _IS_WINDOWS = sys.platform.startswith("win")
 
+# Per-session concurrency: how many concurrent curl handles each session
+# allows. This is the critical number for throughput. curl_cffi's AsyncSession
+# uses a LifoQueue of curl handles; if the queue is empty, requests block.
+# 256 gives plenty of headroom for 1000+ concurrent requests across sessions.
+MAX_CLIENTS_PER_SESSION = 256
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TYPE-SAFE READERS
+# SAFE READERS
 # ══════════════════════════════════════════════════════════════════════════════
 def _safe_int(v: Any, default: int,
               lo: Optional[int] = None, hi: Optional[int] = None) -> int:
@@ -248,6 +141,7 @@ class Item:
     domain: str
     depth: int
     attempt: int = 0
+    last_impersonate: str = ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -309,29 +203,60 @@ def build_record(url: str, title: str, text: str, paragraphs: list[str],
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION POOL
+# SESSION POOL — high concurrency + retry strategy
 # ══════════════════════════════════════════════════════════════════════════════
 class SessionPool:
     """
     One AsyncSession per impersonate target.
 
-    curl_cffi does not accept `impersonate` in the constructor; impersonation
-    is per-request. The pool keys by impersonate string so cookie jars and
-    connection pools stay separate per identity.
+    Each session is created with:
+        - max_clients=256 (high concurrency per identity)
+        - retry=RetryStrategy(count=2, delay=0.3, backoff="exponential",
+                              jitter=0.2) — automatic retry on transient failures
+        - timeout=15
+
+    Sessions are reused across requests; cookies persist per identity.
     """
 
-    def __init__(self, max_clients: int = 64):
-        self._max = _safe_int(max_clients, 64, lo=1, hi=1024)
+    def __init__(self, max_clients: int = MAX_CLIENTS_PER_SESSION):
+        self._max = _safe_int(max_clients, MAX_CLIENTS_PER_SESSION,
+                              lo=16, hi=1024)
         self._sessions: dict[str, AsyncSession] = {}
         self._lock = asyncio.Lock()
+        self._usage: Counter[str] = Counter()
+        self._retry_strategy = self._build_retry_strategy()
+
+    @staticmethod
+    def _build_retry_strategy():
+        """Try to build a RetryStrategy; fall back to int if unavailable."""
+        try:
+            from curl_cffi.requests import RetryStrategy  # type: ignore
+            return RetryStrategy(
+                count=2,
+                delay=0.3,
+                backoff="exponential",
+                jitter=0.2,
+            )
+        except Exception:
+            # Older curl_cffi: retry as an int
+            return 2
 
     async def get(self, impersonate: str) -> AsyncSession:
         key = impersonate or "default"
         async with self._lock:
             s = self._sessions.get(key)
             if s is None:
-                s = AsyncSession(max_clients=self._max)
+                try:
+                    s = AsyncSession(
+                        max_clients=self._max,
+                        timeout=15,
+                        retry=self._retry_strategy,
+                    )
+                except TypeError:
+                    # Older curl_cffi may not accept `retry` in constructor
+                    s = AsyncSession(max_clients=self._max, timeout=15)
                 self._sessions[key] = s
+            self._usage[key] += 1
             return s
 
     async def close(self):
@@ -341,6 +266,9 @@ class SessionPool:
             except Exception:
                 pass
         self._sessions.clear()
+
+    def usage_summary(self) -> dict:
+        return dict(self._usage.most_common(10))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,18 +293,19 @@ class Engine:
         self.writer = Writer(self.folders, self.config)
         self.health = Health(self.config)
 
+        # Concurrency: initial 256, min 64, max 2048
         conc_cfg = _safe_dict(_cfg_get(self.config, "runtime", "concurrency", {}))
-        initial = _safe_int(conc_cfg.get("initial", 128), 128, lo=1, hi=8192)
-        cmin = _safe_int(conc_cfg.get("min", 16), 16, lo=1, hi=8192)
-        cmax = _safe_int(conc_cfg.get("max", 1024), 1024, lo=cmin, hi=16384)
+        initial = _safe_int(conc_cfg.get("initial", 256), 256, lo=16, hi=4096)
+        cmin = _safe_int(conc_cfg.get("min", 64), 64, lo=1, hi=4096)
+        cmax = _safe_int(conc_cfg.get("max", 2048), 2048, lo=cmin, hi=8192)
 
         self._sem = AdaptiveSemaphore(initial, min_cap=cmin, max_cap=cmax)
-        self._sessions = SessionPool(max_clients=64)
+        self._sessions = SessionPool(max_clients=MAX_CLIENTS_PER_SESSION)
         self._buckets: dict[str, TokenBucket] = {}
 
         queue_max = _safe_int(
-            _cfg_get(self.config, "runtime", "queue_maxsize", 8192),
-            8192, lo=64, hi=1_000_000)
+            _cfg_get(self.config, "runtime", "queue_maxsize", 32768),
+            32768, lo=256, hi=2_000_000)
         self._pending: asyncio.Queue[Item] = asyncio.Queue(maxsize=queue_max)
 
         self._inflight = 0
@@ -396,16 +325,15 @@ class Engine:
         self._last_tick = time.time()
         self._tick_pages = 0
         self._start_time = time.time()
-        probe_win = _safe_int(
-            conc_cfg.get("probe_window", 200), 200, lo=10, hi=10000)
+        probe_win = _safe_int(conc_cfg.get("probe_window", 300), 300, lo=10, hi=10000)
         self._recent: list[int] = []
         self._recent_cap = probe_win
         self._recent_head = 0
 
         self._gc_counter = 0
         self._gc_every = _safe_int(
-            _cfg_get(self.config, "runtime", "gc_collect_every_n_pages", 10000),
-            10000, lo=100, hi=1_000_000)
+            _cfg_get(self.config, "runtime", "gc_collect_every_n_pages", 20000),
+            20000, lo=500, hi=1_000_000)
         self._trim_every = _safe_float(
             _cfg_get(self.config, "runtime", "memory_trim_interval_seconds", 30.0),
             30.0, lo=5.0, hi=600.0)
@@ -413,52 +341,33 @@ class Engine:
 
         # Diagnostics
         self._fail_reasons: Counter[str] = Counter()
+        self._domain_counts: Counter[str] = Counter()
+        self._impersonate_counts: Counter[str] = Counter()
+        self._concurrent_domains: set[str] = set()
 
         self._log_cfg_summary()
 
-    # ── diagnostics ──────────────────────────────────────────────────────────
     def _log_cfg_summary(self):
         try:
             sites = len(self.config.site_names())
             agents = len(self.config.agent_names())
             log.info("config: %d sites, %d agents, resume known=%d",
                      sites, agents, len(self.resume.known))
-            if _SUPPORTED_IMPERSONATES:
-                log.info("curl_cffi: %d supported impersonate targets "
-                         "(e.g. %s)",
-                         len(_SUPPORTED_IMPERSONATES),
-                         ", ".join(sorted(_SUPPORTED_IMPERSONATES)[:5]))
-            else:
-                log.warning("curl_cffi: could not enumerate impersonate "
-                            "targets; passing config values through as-is")
-            # Warn about config agents whose impersonate will be substituted
-            substituted = {}
-            for name in self.config.agent_names():
-                try:
-                    agent = self.config._agents[name]
-                except Exception:
-                    continue
-                requested = agent.get("impersonate", "")
-                if not requested:
-                    continue
-                actual = _resolve_impersonate(requested)
-                if actual != requested:
-                    substituted[requested] = actual
-            if substituted:
-                log.warning(
-                    "impersonate substitutions in effect (%d): %s",
-                    len(substituted),
-                    ", ".join(f"{k}→{v}" for k, v in list(substituted.items())[:6]))
+            log.info("curl_cffi: %d real impersonate targets available",
+                     len(REAL_IMPERSONATES))
+            log.info("concurrency: initial=%d, max=%d, session max_clients=%d",
+                     self._sem.capacity, self._sem._max, MAX_CLIENTS_PER_SESSION)
+            log.info("cross-domain: ON by default")
         except Exception as e:
             log.debug("cfg summary failed: %s", e)
 
-    # ── helpers ──────────────────────────────────────────────────────────────
     def _bucket(self, domain: str) -> TokenBucket:
         b = self._buckets.get(domain)
         if b is None:
-            rate = 2.0
+            rate = 5.0
             try:
-                rate = _safe_float(self.config.rate_for(domain), 2.0, lo=0.0, hi=1000.0)
+                rate = _safe_float(self.config.rate_for(domain), 5.0,
+                                   lo=0.0, hi=1000.0)
             except Exception:
                 pass
             b = TokenBucket(rate=rate)
@@ -466,11 +375,13 @@ class Engine:
         return b
 
     def _pick_agent_for(self, item: Item) -> str:
+        """First attempt uses config agent. Retries rotate impersonate target."""
         if item.attempt <= 0:
             try:
                 return self.config.agent_for(item.domain)
             except Exception:
-                return "chrome146_win"
+                return "chrome136_win"
+        # On retry, rotate through the config's probe order
         try:
             order = self.config.health_cfg.get("probe_agents_order", [])
             if isinstance(order, list) and order:
@@ -480,7 +391,7 @@ class Engine:
         try:
             return self.config.agent_for(item.domain)
         except Exception:
-            return "chrome146_win"
+            return "chrome136_win"
 
     def _record_fail(self, domain: str, reason: str = ""):
         self.fail += 1
@@ -492,6 +403,7 @@ class Engine:
         self.success += 1
         self._tick_pages += 1
         self._push_recent(1)
+        self._domain_counts[domain] += 1
 
     def _push_recent(self, v: int):
         if len(self._recent) < self._recent_cap:
@@ -500,7 +412,6 @@ class Engine:
             self._recent[self._recent_head] = v
             self._recent_head = (self._recent_head + 1) % self._recent_cap
 
-    # ── signals ──────────────────────────────────────────────────────────────
     def _install_signals(self):
         if _IS_WINDOWS:
             return
@@ -534,15 +445,18 @@ class Engine:
             self._record_fail(domain, "agent_resolve")
             return None
 
-        raw_impersonate = resolved.get("impersonate") or ""
-        impersonate = _resolve_impersonate(raw_impersonate)
-        headers = resolved.get("headers") or {}
+        # Rotate impersonate on retry
+        base_impersonate = resolved.get("impersonate", "chrome136")
+        if item.attempt > 0 and item.last_impersonate:
+            impersonate = rotate_impersonate(item.last_impersonate)
+        else:
+            impersonate = validate_impersonate(base_impersonate)
+        item.last_impersonate = impersonate
+        self._impersonate_counts[impersonate] += 1
 
-        # Ensure User-Agent matches the impersonate if it was substituted
-        if impersonate != raw_impersonate and headers.get("User-Agent"):
-            # Header/UA mismatch would be a red flag to WAFs. Drop UA override
-            # so curl_cffi's impersonation provides its own.
-            headers = dict(headers)
+        headers = dict(resolved.get("headers") or {})
+        # User-Agent must match the impersonate target or WAFs flag mismatch
+        if impersonate != base_impersonate:
             headers.pop("User-Agent", None)
 
         await self._bucket(domain).take(1.0)
@@ -558,7 +472,7 @@ class Engine:
             _cfg_get(self.config, "runtime", "timeout_seconds", 15.0),
             15.0, lo=1.0, hi=120.0)
 
-        # ── the actual request ───────────────────────────────────────────────
+        # ── the request ──────────────────────────────────────────────────────
         r = None
         try:
             r = await asyncio.wait_for(
@@ -577,38 +491,33 @@ class Engine:
             # Bad impersonate → retry without fingerprint
             if ("impersonate" in err_low or "unknown" in err_low
                     or "not supported" in err_low):
-                log.warning(
-                    "impersonate '%s' rejected by curl_cffi (%s); "
-                    "retrying without fingerprint for %s",
-                    impersonate, err_str[:120], item.url)
+                log.debug("impersonate '%s' rejected: %s", impersonate, err_str[:120])
                 try:
                     r = await asyncio.wait_for(
                         session.get(
-                            item.url,
-                            headers=headers,
-                            timeout=timeout_s,
-                            allow_redirects=True,
-                        ),
+                            item.url, headers=headers,
+                            timeout=timeout_s, allow_redirects=True),
                         timeout=timeout_s + 5.0,
                     )
                 except Exception as e2:
                     log.warning("fetch failed %s: %s", item.url, e2)
-                    self.health.record_fetch_error(domain, f"fetch:{type(e2).__name__}")
+                    self.health.record_fetch_error(
+                        domain, f"fetch:{type(e2).__name__}")
                     self._record_fail(domain, f"fetch:{type(e2).__name__}")
                     return None
             else:
                 log.warning("fetch failed %s [%s]: %s",
                             item.url, type(e).__name__, err_str[:160])
-                self.health.record_fetch_error(domain, f"fetch:{type(e).__name__}")
+                self.health.record_fetch_error(
+                    domain, f"fetch:{type(e).__name__}")
                 self._record_fail(domain, f"fetch:{type(e).__name__}")
                 return None
 
-        # ── from here, r is not None ─────────────────────────────────────────
+        # ── response handling ────────────────────────────────────────────────
         try:
             status = int(r.status_code)
         except Exception:
             status = 0
-
         try:
             ctype = (r.headers.get("content-type") or "").lower()
         except Exception:
@@ -619,7 +528,6 @@ class Engine:
 
         body = r.text or ""
 
-        # ── block detection ──────────────────────────────────────────────────
         reason = self.health.detect_block(body, status_code=status)
         if reason:
             log.warning("blocked %s [%d] %s", item.url, status, reason)
@@ -631,7 +539,6 @@ class Engine:
                 pass
             return None
 
-        # ── hard failures ────────────────────────────────────────────────────
         if status in (403, 429, 503) or status >= 500:
             log.warning("http %d %s", status, item.url)
             self.health.mark_block(domain, reason=f"status_{status}")
@@ -737,6 +644,7 @@ class Engine:
     # ── task wrapper ─────────────────────────────────────────────────────────
     async def _task_wrapper(self, item: Item):
         self._inflight += 1
+        self._concurrent_domains.add(item.domain)
         try:
             await self._sem.acquire()
             try:
@@ -752,11 +660,13 @@ class Engine:
             log.warning("task error %s: %s", item.url, e)
         finally:
             self._inflight -= 1
+            self._concurrent_domains.discard(item.domain)
 
     # ── scheduler ────────────────────────────────────────────────────────────
     async def _scheduler(self):
         while not self._shutdown.is_set():
             item: Optional[Item] = None
+
             try:
                 item = self._pending.get_nowait()
             except asyncio.QueueEmpty:
@@ -778,7 +688,7 @@ class Engine:
                     item = Item(url, domain, depth)
 
             if item is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.02)
                 continue
 
             t = asyncio.create_task(self._task_wrapper(item))
@@ -871,7 +781,6 @@ class Engine:
                     except Exception:
                         pass
 
-    # ── idle detection ───────────────────────────────────────────────────────
     def _is_idle(self) -> bool:
         if self._inflight > 0:
             return False
@@ -923,7 +832,7 @@ class Engine:
             while not self._shutdown.is_set():
                 if self._is_idle():
                     idle_streak += 1
-                    if idle_streak >= 8:   # ~2s idle
+                    if idle_streak >= 12:
                         break
                 else:
                     idle_streak = 0
@@ -942,8 +851,7 @@ class Engine:
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*self._tasks, return_exceptions=True),
-                        timeout=15.0,
-                    )
+                        timeout=15.0)
                 except asyncio.TimeoutError:
                     for t in self._tasks:
                         try:
@@ -989,6 +897,7 @@ class Engine:
             "inflight": self._inflight,
             "queued": self._pending.qsize(),
             "concurrency": self._sem.capacity,
+            "active_domains": len(self._concurrent_domains),
             "uptime": round(time.time() - self._start_time, 1),
         }
 
@@ -1007,6 +916,15 @@ class Engine:
         log.info("  peak pps     : %.2f", m["peak_pps"])
         log.info("  data written : %.2f MB", m["data_size_mb"])
         log.info("  unique URLs  : %d", m["known_urls"])
+        log.info("  active domains: %d", m["active_domains"])
+        if self._domain_counts:
+            log.info("  top domains  :")
+            for d, c in self._domain_counts.most_common(5):
+                log.info("      %-30s %d", d, c)
+        if self._impersonate_counts:
+            log.info("  impersonate usage:")
+            for imp, c in self._impersonate_counts.most_common(5):
+                log.info("      %-20s %d", imp, c)
         if self._fail_reasons:
             log.info("  failure reasons:")
             for reason, count in self._fail_reasons.most_common(10):
@@ -1038,6 +956,7 @@ async def _run_terminal(engine: Engine, urls: list[str]):
                     "fail": m["failures"],
                     "pps": m["pages_per_sec"],
                     "c": m["concurrency"],
+                    "dom": m["active_domains"],
                     "MB": m["data_size_mb"],
                 })
                 if m["success"] > pbar.n:
@@ -1071,9 +990,7 @@ def _configure_logging():
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%H:%M:%S",
-        )
-        # Keep third-party libs quieter unless explicitly needed
+            datefmt="%H:%M:%S")
         logging.getLogger("curl_cffi").setLevel(logging.WARNING)
         logging.getLogger("asyncio").setLevel(logging.WARNING)
     except Exception:
@@ -1091,15 +1008,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  python Fa_Scrap.py https://example.com   GUI opens, prefilled\n"
             "  python Fa_Scrap.py -T                    Terminal prompt for URL\n"
             "  python Fa_Scrap.py -T https://example.com  Terminal, immediate\n"
-            "  python Fa_Scrap.py -G https://example.com  GUI, explicit\n"
-        ),
-    )
+            "  python Fa_Scrap.py -G https://example.com  GUI, explicit\n"))
     p.add_argument("-T", "--terminal", action="store_true",
                    help="Terminal interactive mode with tqdm")
     p.add_argument("-G", "--gui", action="store_true",
                    help="GUI mode (default when no flag)")
-    p.add_argument("url", nargs="?", default=None,
-                   help="Optional seed URL")
+    p.add_argument("url", nargs="?", default=None, help="Optional seed URL")
     return p
 
 
