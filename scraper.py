@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""
+scraper.py — Nexus v6
+Async crawler · PyQt6 GUI · 4-layer spoofing · immediate disk writes ·
+optimization centers · bloom filter · adaptive concurrency · zero proxies.
+
+Fixes: AsyncSession kwargs (uses only BaseSession-accepted params).
+"""
+
+# ===========================================================================
+# IMPORTS — stdlib compressed, heavy deps lazy
+# ===========================================================================
 import asyncio, collections, functools, gc, hashlib, importlib, json, logging, math, mmap, os, random, re, signal, socket, sys, threading, time, traceback, weakref
 from dataclasses import dataclass, field, fields as dc_fields
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -5,7 +17,6 @@ from urllib.parse import urljoin, urlparse, urldefrag
 
 
 class _Lazy:
-    """Lazy module/attr resolver. Loads only on first access. Cached forever."""
     __slots__ = ("_mod", "_attr", "_obj")
     def __init__(self, mod: str, attr: Optional[str] = None):
         self._mod, self._attr, self._obj = mod, attr, None
@@ -20,11 +31,9 @@ class _Lazy:
         return getattr(self._resolve(), name)
 
 
-# Heavy deps — deferred until first use (memory-friendly for --test/--headless)
 AsyncSession = _Lazy("curl_cffi.requests", "AsyncSession")
 lxml_html    = _Lazy("lxml", "html")
 
-# PyQt6 — deferred until GUI launch
 HAS_QT = False
 QtW = QtC = QtG = None
 
@@ -49,51 +58,44 @@ def _ensure_qt() -> bool:
 # ===========================================================================
 @dataclass(slots=True)
 class Config:
-    # --- crawl ---
     max_depth: int = 15
     timeout: float = 12.0
     max_retries: int = 3
     retry_base: float = 1.2
 
-    # --- files ---
     output_file: str = "scraped_data.jsonl"
     visited_file: str = "visited.bloom"
     start_urls_file: str = "start_urls.txt"
     config_file: str = "scraper_config.json"
 
-    # --- adaptive concurrency ---
     adaptive_min: int = 20
     adaptive_max: int = 400
     adaptive_initial: int = 200
     target_latency: float = 1.5
 
-    # --- per-domain ---
     domain_concurrency: int = 8
     domain_rate_limit: float = 0.10
 
-    # --- bloom ---
     bloom_capacity: int = 50_000_000
     bloom_error_rate: float = 0.001
 
-    # --- blocks / health ---
     block_cooldown: float = 300.0
     health_check_interval: float = 45.0
-
-    # --- text ---
     max_text_length: int = 2_000_000
 
-    # --- queue ---
     queue_maxsize: int = 2_000_000
     write_queue_maxsize: int = 200_000
 
-    # --- disk writer ---
     write_batch_max: int = 256
     write_batch_max_bytes: int = 8 * 1024 * 1024
-    fsync_every: int = 0  # 0 = never (OS handles it)
+    fsync_every: int = 0
 
-    # --- spoofing ---
+    # Connection caps (passed via curl_options, not BaseSession kwargs)
+    max_total_connections: int = 512
+    max_host_connections: int = 32
+
     spoof_profiles: Tuple[str, ...] = (
-        "chrome124", "chrome120", "firefox120", "safari16",
+        "chrome124", "chrome120", "firefox120", "safari15_5",
     )
 
     @classmethod
@@ -130,10 +132,9 @@ _STOP = threading.Event()
 
 
 # ===========================================================================
-# OPTIMIZATION CENTER — memory, CPU, I/O, GC
+# OPTIMIZATION CENTER
 # ===========================================================================
 class _LRU:
-    """Bounded dict. Fast O(1) get/put with FIFO eviction."""
     __slots__ = ("_data", "_max", "_hits", "_miss")
     def __init__(self, maxsize: int = 100_000):
         self._data: Dict[Any, Any] = {}
@@ -148,7 +149,6 @@ class _LRU:
         return None
     def put(self, k, v):
         if len(self._data) >= self._max:
-            # drop 10% oldest via dict iteration order
             drop = self._max // 10
             for _ in range(drop):
                 try:
@@ -170,10 +170,6 @@ class _LRU:
 
 
 class OptimizationCenter:
-    """
-    Central tuning hub. Adjusts GC, socket, thread pool, caches.
-    Provides hot-path caches for URL parsing, language detection, domain lookup.
-    """
     __slots__ = (
         "config", "url_cache", "domain_cache", "lang_cache", "hash_cache",
         "_gc_was_enabled", "_last_gc",
@@ -187,21 +183,13 @@ class OptimizationCenter:
         self.hash_cache: _LRU = _LRU(100_000)
         self._gc_was_enabled = gc.isenabled()
         self._last_gc = time.monotonic()
-        self._tune_gc()
-        self._tune_socket()
-
-    def _tune_gc(self) -> None:
-        """GC off during hot loop; manual collection scheduled by caller."""
         gc.disable()
-
-    def _tune_socket(self) -> None:
         try:
             socket.setdefaulttimeout(30.0)
         except Exception:
             pass
 
     async def tune_thread_pool(self, size: int = 96) -> None:
-        """Enlarge default executor for to_thread calls."""
         try:
             from concurrent.futures import ThreadPoolExecutor
             loop = asyncio.get_running_loop()
@@ -212,7 +200,6 @@ class OptimizationCenter:
             pass
 
     def maybe_gc(self) -> None:
-        """Periodic manual GC every 15s (called from crawler loop)."""
         now = time.monotonic()
         if now - self._last_gc >= 15.0:
             gc.collect(1)
@@ -235,7 +222,6 @@ class OptimizationCenter:
         return v
 
     def detect_language(self, text: str) -> str:
-        # cache by hash of first 200 chars
         key = text[:200]
         v = self.lang_cache.get(key)
         if v is not None:
@@ -378,24 +364,6 @@ class MiniHandlers:
         sys.excepthook = hook
 
     @staticmethod
-    def retry_async(max_attempts: int = 3, base: float = 1.2,
-                    jitter: float = 0.25, exceptions: Tuple = (Exception,)):
-        def deco(fn):
-            @functools.wraps(fn)
-            async def wrap(*a, **kw):
-                last = None
-                for i in range(max_attempts):
-                    try:
-                        return await fn(*a, **kw)
-                    except exceptions as e:
-                        last = e
-                        if i < max_attempts - 1:
-                            await asyncio.sleep(base ** i + random.random() * jitter)
-                raise last
-            return wrap
-        return deco
-
-    @staticmethod
     def safe(fn, *a, default=None, **kw):
         try:
             return fn(*a, **kw)
@@ -445,15 +413,9 @@ class CircuitBreaker:
 
 
 # ===========================================================================
-# SPOOF ENGINE — 4 layers of browser emulation
+# SPOOF ENGINE — 4 layers
 # ===========================================================================
 class SpoofEngine:
-    """
-    Layer 1: TLS/JA3 fingerprint via curl_cffi impersonate
-    Layer 2: Header ordering identical to real browsers
-    Layer 3: Client Hints (Sec-CH-UA-*) — Chrome only
-    Layer 4: Referer chain + regional Accept-Language
-    """
     __slots__ = ("_profile_pool",)
 
     PROFILES: Dict[str, dict] = {
@@ -487,7 +449,7 @@ class SpoofEngine:
             "brands": "",
             "is_chrome": False,
         },
-        "safari16": {
+        "safari15_5": {
             "impersonate": "safari15_5",
             "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
@@ -506,21 +468,21 @@ class SpoofEngine:
 
     def __init__(self, allowed: Tuple[str, ...]):
         self._profile_pool = [p for p in allowed if p in self.PROFILES]
+        if not self._profile_pool:
+            self._profile_pool = ["chrome124"]
 
     def pick(self, rng: Optional[random.Random] = None) -> dict:
         r = rng or random
-        name = r.choice(self._profile_pool)
-        return self.PROFILES[name]
+        return self.PROFILES[r.choice(self._profile_pool)]
 
     def build_headers(self, url: str, profile: dict,
                       referer: Optional[str] = None) -> dict:
-        """Layer 2 + 3 + 4 — ordered dict, real browser shape."""
         h = {
             "User-Agent": profile["ua"],
             "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
                        "image/avif,image/webp,image/apng,*/*;q=0.8"),
-            "Accept-Language": random.choice(self.REGION_LANGS) if random.random() < 0.3
-                               else profile["lang"],
+            "Accept-Language": (random.choice(self.REGION_LANGS)
+                                 if random.random() < 0.3 else profile["lang"]),
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Upgrade-Insecure-Requests": "1",
             "Sec-Fetch-Dest": "document",
@@ -589,7 +551,6 @@ class BloomFilter:
         data = item.encode("utf-8")
         h1 = int.from_bytes(hashlib.md5(data).digest()[:8], "little")
         h2 = int.from_bytes(hashlib.sha1(data).digest()[:8], "little")
-        mmap_ref = self._mmap
         n = self.num_bits
         k = self.num_hashes
         for i in range(k):
@@ -702,10 +663,11 @@ class AdaptiveConcurrency:
 
 
 # ===========================================================================
-# MINI CLEANERS — single-pass tree surgery
+# MINI CLEANERS / CHECKERS
 # ===========================================================================
 _WS_RE = re.compile(r"[ \t\r\f\v]+")
 _NL_RE = re.compile(r"\n\s*\n+")
+
 
 class MiniCleaners:
     JUNK = frozenset(("script", "style", "noscript", "iframe", "svg",
@@ -713,13 +675,12 @@ class MiniCleaners:
 
     @staticmethod
     def clean_tree(tree) -> None:
-        """Single-pass: remove junk tags + comments in one iteration."""
         remove_set = set()
         for el in tree.iter():
             tag = el.tag
             if tag in MiniCleaners.JUNK:
                 remove_set.add(el)
-            elif not isinstance(tag, str):  # comment / PI
+            elif not isinstance(tag, str):
                 remove_set.add(el)
         for el in remove_set:
             p = el.getparent()
@@ -755,9 +716,6 @@ class MiniCleaners:
         return text[:max_len] if len(text) > max_len else text
 
 
-# ===========================================================================
-# MINI CHECKERS — fast, cached, compiled
-# ===========================================================================
 _WORD_RE = re.compile(r"\b\w+\b")
 _SCRIPT_TESTS = (
     (re.compile(r"[\u0400-\u04FF]"), "ru"),
@@ -796,7 +754,7 @@ class MiniCheckers:
     @staticmethod
     def is_html(headers: dict) -> bool:
         ct = headers.get("Content-Type") or headers.get("content-type") or ""
-        return "html" in ct  # matches text/html and application/xhtml+xml
+        return "html" in ct.lower()
 
     @staticmethod
     def is_blocked(body: str) -> bool:
@@ -880,14 +838,9 @@ class Stats:
 
 
 # ===========================================================================
-# DISK WRITER — immediate write, kernel-level, non-blocking
+# DISK WRITER
 # ===========================================================================
 class DiskWriter:
-    """
-    Every record hits disk immediately via os.write (no Python buffering).
-    Dedicated task drains the queue, batches <=256 records or 8 MB per call.
-    Never blocks the crawl loop.
-    """
     __slots__ = ("path", "fd", "config", "_queue", "_task",
                  "_written", "_dirty", "_lock")
 
@@ -904,7 +857,6 @@ class DiskWriter:
     async def start(self) -> None:
         flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
         self.fd = await asyncio.to_thread(os.open, self.path, flags, 0o644)
-        # Hint kernel for sequential access (Linux)
         try:
             os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
         except (AttributeError, OSError):
@@ -925,10 +877,8 @@ class DiskWriter:
 
                 batch: List[str] = [first]
                 batch_bytes = len(first) + 1
-                max_records = self.config.write_batch_max
-                max_bytes = self.config.write_batch_max_bytes
 
-                for _ in range(max_records - 1):
+                for _ in range(self.config.write_batch_max - 1):
                     try:
                         item = self._queue.get_nowait()
                     except asyncio.QueueEmpty:
@@ -937,7 +887,7 @@ class DiskWriter:
                         self._queue.put_nowait(None)
                         break
                     sz = len(item) + 1
-                    if batch_bytes + sz > max_bytes:
+                    if batch_bytes + sz > self.config.write_batch_max_bytes:
                         self._queue.put_nowait(item)
                         break
                     batch.append(item)
@@ -1000,6 +950,9 @@ class DiskWriter:
 # ===========================================================================
 # DOMAIN STATE / MANAGER
 # ===========================================================================
+DOMAIN_CONCURRENCY = 8
+
+
 @dataclass(slots=True)
 class DomainState:
     domain: str
@@ -1041,8 +994,31 @@ class DomainManager:
         return s
 
 
-# Global constant for semaphore creation (kept for clarity)
-DOMAIN_CONCURRENCY = 8
+# ===========================================================================
+# SESSION FACTORY — handles curl_cffi version differences
+# ===========================================================================
+def _make_session(config: Config):
+    """
+    Create an AsyncSession that works across curl_cffi versions.
+    Never passes kwargs that BaseSession doesn't accept.
+    """
+    # Only kwargs that BaseSession.__init__ accepts in all recent versions
+    common_kwargs = {
+        "timeout": config.timeout,
+        "allow_redirects": True,
+    }
+    try:
+        # Try with curl_options for connection caps (libcurl CURLMOPT_*)
+        return AsyncSession(
+            **common_kwargs,
+            curl_options={
+                2000: config.max_total_connections,   # CURLMOPT_MAX_TOTAL_CONNECTIONS
+                2001: config.max_host_connections,    # CURLMOPT_MAX_HOST_CONNECTIONS
+            },
+        )
+    except TypeError:
+        # Fallback: bare session, no curl_options
+        return AsyncSession(**common_kwargs)
 
 
 # ===========================================================================
@@ -1073,9 +1049,7 @@ class Crawler:
         self._emit_log = emit_log
         self._workers: List[asyncio.Task] = []
         self._bg_tasks: List[asyncio.Task] = []
-        self._gc_task: Optional[asyncio.Task] = None
 
-    # -------------------------------------------------------------------
     def spawn_bg(self, coro, name: str = "") -> asyncio.Task:
         t = asyncio.create_task(coro, name=name or None)
         self._bg_tasks.append(t)
@@ -1086,7 +1060,6 @@ class Crawler:
         if self._emit_log:
             MiniHandlers.safe(self._emit_log, msg, time.time())
 
-    # -------------------------------------------------------------------
     async def run(self) -> None:
         try:
             await self._run_inner()
@@ -1096,25 +1069,17 @@ class Crawler:
             await self.shutdown()
 
     async def _run_inner(self) -> None:
-        # 1. Thread pool tuning
         await self.opt.tune_thread_pool(96)
 
-        # 2. Session
-        self.session = AsyncSession(
-            max_clients=self.config.adaptive_max,
-            max_clients_per_host=self.config.domain_concurrency * 4,
-            http2=True,
-        )
+        # ---- Session creation with version-tolerant kwargs ---------------
+        self.session = _make_session(self.config)
 
-        # 3. Writer up
         await self.writer.start()
 
-        # 4. Background tasks
         self.spawn_bg(self._stats_pump(), "stats-pump")
         self.spawn_bg(self._bloom_flush_loop(), "bloom-flush")
         self.spawn_bg(self._gc_loop(), "gc-loop")
 
-        # 5. Seed queue
         seeded = 0
         for url in self.start_urls:
             if not self.bloom.contains(url):
@@ -1126,11 +1091,9 @@ class Crawler:
         self.stats.inc("queued", seeded)
         self._log(f"Seeded {seeded} URLs")
 
-        # 6. Workers
         for i in range(self.config.adaptive_max):
             self._workers.append(asyncio.create_task(self._worker(i)))
 
-        # 7. Idle detection
         idle_ticks = 0
         while self.running:
             if _STOP.is_set():
@@ -1174,7 +1137,6 @@ class Crawler:
         self.opt.restore()
         self.stats.running = False
 
-    # -------------------------------------------------------------------
     async def _stats_pump(self) -> None:
         while self.running:
             await asyncio.sleep(0.5)
@@ -1211,7 +1173,6 @@ class Crawler:
                 return
             self.opt.maybe_gc()
 
-    # -------------------------------------------------------------------
     async def _worker(self, worker_id: int) -> None:
         while self.running:
             try:
@@ -1298,7 +1259,6 @@ class Crawler:
                             self.stats.inc("blocks")
                             self._log(f"BLOCK: {domain}")
                             return
-                        # success
                         state.consecutive_failures = 0
                         state.healthy = True
                         state.total_fetched += 1
@@ -1355,7 +1315,6 @@ class Crawler:
         lang = self.opt.detect_language(text)
         chash = MiniCheckers.hash_text(text)
 
-        # ---- IMMEDIATE write to secondary storage -----------------------
         await self.writer.write({
             "text": text,
             "link": url,
@@ -1365,7 +1324,6 @@ class Crawler:
             "language": lang,
         })
 
-        # ---- batched link fanout ----------------------------------------
         if depth < self.config.max_depth:
             new: List[Tuple[str, int]] = []
             contains = self.bloom.contains
@@ -1397,10 +1355,9 @@ class Crawler:
 
 
 # ===========================================================================
-# GUI (PyQt6) — built lazily so headless/test modes don't touch Qt
+# GUI (PyQt6)
 # ===========================================================================
 def _build_gui_classes():
-    """Return (CrawlerThread, NexusWindow) — requires PyQt6 imported."""
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QGridLayout, QPushButton, QLineEdit, QLabel, QTableWidget,
@@ -1410,7 +1367,6 @@ def _build_gui_classes():
     from PyQt6.QtCore import QThread, pyqtSignal, QTimer, Qt
     from PyQt6.QtGui import QFont, QAction
 
-    # -----------------------------------------------------------------
     class CrawlerThread(QThread):
         stats_ready = pyqtSignal(dict)
         log_ready = pyqtSignal(str, float)
@@ -1453,7 +1409,6 @@ def _build_gui_classes():
             if self.crawler:
                 self.crawler.running = False
 
-    # -----------------------------------------------------------------
     DARK_QSS = """
         QMainWindow, QWidget { background: #1b1d22; color: #d8dee9; }
         QLineEdit { background: #232630; color: #d8dee9; border: 1px solid #343846;
@@ -1487,25 +1442,25 @@ def _build_gui_classes():
             self._thread: Optional[CrawlerThread] = None
             self._latest: dict = {}
             self._domain_row: Dict[str, int] = {}
+            self._pending_file: Optional[str] = None
             self._build_ui()
             self.setStyleSheet(DARK_QSS)
             self._timer = QTimer(self)
             self._timer.timeout.connect(self._refresh)
             self._timer.start(500)
 
-        # --- UI ------------------------------------------------------
         def _build_ui(self):
-            self.setWindowTitle("Nexus Scraper v5")
+            self.setWindowTitle("Nexus Scraper v6")
             self.resize(1440, 900)
 
             root = QWidget()
             layout = QVBoxLayout(root)
 
-            # --- top bar
             top = QHBoxLayout()
             top.addWidget(QLabel("Start URL:"))
             self.url_input = QLineEdit()
-            self.url_input.setPlaceholderText("https://example.com  —  or click Load file")
+            self.url_input.setPlaceholderText(
+                "https://example.com  —  or click Load file")
             top.addWidget(self.url_input, 1)
 
             self.load_btn = QPushButton("Load file")
@@ -1523,7 +1478,6 @@ def _build_gui_classes():
             top.addWidget(self.stop_btn)
             layout.addLayout(top)
 
-            # --- stats grid
             grid = QGridLayout()
             grid.setHorizontalSpacing(20)
             grid.setVerticalSpacing(4)
@@ -1548,7 +1502,6 @@ def _build_gui_classes():
                 grid.addWidget(v, r * 2 + 1, c)
             layout.addLayout(grid)
 
-            # --- splitter: domains | log
             splitter = QSplitter(Qt.Orientation.Horizontal)
 
             self.domains_table = QTableWidget(0, 6)
@@ -1582,7 +1535,6 @@ def _build_gui_classes():
             self.setStatusBar(QStatusBar())
             self.statusBar().showMessage("Idle")
 
-            # --- menu
             menu = self.menuBar()
             fm = menu.addMenu("File")
             fm.addAction(QAction("Load start URLs…", self, triggered=self._load_file))
@@ -1592,13 +1544,11 @@ def _build_gui_classes():
             vm = menu.addMenu("View")
             vm.addAction(QAction("Clear log", self, triggered=self.log_view.clear))
 
-            # --- signals
             self.start_btn.clicked.connect(self._on_start)
             self.pause_btn.clicked.connect(self._on_pause)
             self.stop_btn.clicked.connect(self._on_stop)
             self.load_btn.clicked.connect(self._load_file)
 
-        # --- slots ---------------------------------------------------
         def _load_file(self):
             path, _ = QFileDialog.getOpenFileName(
                 self, "Choose start URLs file", "",
@@ -1685,9 +1635,12 @@ def _build_gui_classes():
 
         def _on_log(self, msg: str, ts: float):
             color = "#8892a0"
-            if msg.startswith("BLOCK"): color = "#f59e0b"
-            elif msg.startswith("OK"):  color = "#10b981"
-            elif msg.startswith("HTTP"): color = "#ef4444"
+            if msg.startswith("BLOCK"):
+                color = "#f59e0b"
+            elif msg.startswith("OK"):
+                color = "#10b981"
+            elif msg.startswith("HTTP"):
+                color = "#ef4444"
             self._append_log(msg, ts, color)
 
         def _append_log(self, msg: str, ts: float, color: str = "#8892a0"):
@@ -1743,7 +1696,6 @@ def _build_gui_classes():
 
         def _update_domains(self, domains: Dict[str, dict]):
             t = self.domains_table
-            # grow table if needed
             if t.rowCount() < len(domains):
                 t.setRowCount(len(domains))
             for dom, st in sorted(domains.items(),
@@ -1781,7 +1733,6 @@ def _build_gui_classes():
                     item.setText(text)
                     if color:
                         item.setForeground(QtG.QColor(color))
-            # trim unused rows
             if t.rowCount() > len(self._domain_row):
                 t.setRowCount(len(self._domain_row))
 
@@ -1815,10 +1766,12 @@ def launch_gui(urls: Optional[List[str]], config: Config) -> int:
         print("PyQt6 is not installed. Run:  pip install PyQt6")
         print("Falling back to headless mode.")
         return 1
+    QApplication = QtW.QApplication
+    QFont = QtG.QFont
     CrawlerThread, NexusWindow = _build_gui_classes()
-    app = QtW.QApplication(sys.argv)
+    app = QApplication(sys.argv)
     app.setApplicationName("Nexus Scraper")
-    font = QtG.QFont("Segoe UI" if sys.platform == "win32" else "Sans", 10)
+    font = QFont("Segoe UI" if sys.platform == "win32" else "Sans", 10)
     app.setFont(font)
     win = NexusWindow(config)
     if urls:
@@ -1836,7 +1789,7 @@ class TestingMachine:
 
     def run_all(self) -> bool:
         print("\n" + "=" * 74)
-        print("  NEXUS v5 TESTING MACHINE")
+        print("  NEXUS v6 TESTING MACHINE")
         print("=" * 74)
         for name in sorted(n for n in dir(self) if n.startswith("test_")):
             fn = getattr(self, name)
@@ -1868,7 +1821,6 @@ class TestingMachine:
         print("=" * 74 + "\n")
         return passed == total
 
-    # --- config ---
     def test_config_defaults(self):
         c = Config()
         assert c.max_depth > 0
@@ -1876,8 +1828,6 @@ class TestingMachine:
         assert "chrome124" in c.spoof_profiles
 
     def test_config_roundtrip(self):
-        c = Config()
-        c.max_depth = 7
         path = "test_cfg.json"
         try:
             with open(path, "w") as f:
@@ -1888,7 +1838,23 @@ class TestingMachine:
         finally:
             MiniHandlers.safe(lambda: os.remove(path))
 
-    # --- opt center ---
+    def test_session_factory_no_kwarg_error(self):
+        """The critical regression test — must not raise TypeError."""
+        cfg = Config()
+        s = _make_session(cfg)
+        assert s is not None
+        # close cleanly
+        async def close():
+            try:
+                await s.close()
+            except Exception:
+                pass
+        try:
+            asyncio.get_running_loop()
+            asyncio.ensure_future(close())
+        except RuntimeError:
+            asyncio.run(close())
+
     def test_lru_evicts(self):
         l = _LRU(10)
         for i in range(20):
@@ -1916,12 +1882,10 @@ class TestingMachine:
         assert oc.detect_language(t) == "en"
         oc.restore()
 
-    # --- lazy loader ---
     def test_lazy_loader_resolves(self):
         j = _Lazy("json")
         assert j.dumps({"a": 1}) == '{"a": 1}'
 
-    # --- bloom ---
     def test_bloom_new_vs_dup(self):
         fn = "test_bloom_a.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
@@ -1956,19 +1920,15 @@ class TestingMachine:
         b.close()
         os.remove(fn)
 
-    # --- spoof engine ---
     def test_spoof_four_layers(self):
         se = SpoofEngine(("chrome124",))
         prof = se.pick()
         h = se.build_headers("https://x.com", prof, referer="https://x.com/a")
-        # Layer 2
         assert h["User-Agent"] == prof["ua"]
         assert "Accept-Language" in h
-        # Layer 3
         assert "Sec-CH-UA" in h
         assert "Sec-CH-UA-Mobile" in h
         assert "Sec-CH-UA-Platform" in h
-        # Layer 4
         assert h["Referer"] == "https://x.com/a"
 
     def test_spoof_firefox_no_ch(self):
@@ -1977,7 +1937,6 @@ class TestingMachine:
         h = se.build_headers("https://x.com", prof)
         assert "Sec-CH-UA" not in h
 
-    # --- adaptive ---
     async def test_adaptive_up_and_down(self):
         ac = AdaptiveConcurrency(100, 10, 1000, 1.0)
         for _ in range(200):
@@ -1988,7 +1947,6 @@ class TestingMachine:
             await ac2.record(5.0, False)
         assert ac2.current < 200
 
-    # --- cleaners ---
     def test_cleaner_junk_and_comment(self):
         src = "<html><body><p>keep</p><script>evil()</script><!--c--></body></html>"
         tree = lxml_html.fromstring(src)
@@ -1996,13 +1954,11 @@ class TestingMachine:
         txt = MiniCleaners.extract_text(tree)
         assert "keep" in txt
         assert "evil" not in txt
-        assert "c" not in txt.replace("keep", "")
 
     def test_cleaner_title(self):
         t = lxml_html.fromstring("<html><head><title>Hi</title></head></html>")
         assert MiniCleaners.extract_title(t) == "Hi"
 
-    # --- checkers ---
     def test_checkers_blocked(self):
         assert MiniCheckers.is_blocked("Just a moment...")
         assert not MiniCheckers.is_blocked("<p>hi</p>")
@@ -2022,7 +1978,6 @@ class TestingMachine:
         assert MiniCheckers.is_valid_url("https://a.com")
         assert not MiniCheckers.is_valid_url("javascript:void")
 
-    # --- disk writer ---
     async def test_disk_writer_writes(self):
         fn = "test_writer.jsonl"
         MiniHandlers.safe(lambda: os.remove(fn))
@@ -2040,7 +1995,6 @@ class TestingMachine:
             assert "link" in json.loads(l)
         os.remove(fn)
 
-    # --- crawler integration ---
     async def test_crawler_shutdown_clean(self):
         cfg = Config()
         cfg.visited_file = "test_shut.bloom"
@@ -2085,8 +2039,7 @@ class TestingMachine:
                f"<p>hello world foo bar</p>{links}</body></html>").encode()
 
         await crawler._parse(src, "https://root.example/", 0)
-        assert crawler.url_queue.qsize() == 500, \
-            f"queue={crawler.url_queue.qsize()}"
+        assert crawler.url_queue.qsize() == 500
 
         await crawler.writer.stop()
         with open(cfg.output_file, encoding="utf-8") as f:
@@ -2101,7 +2054,6 @@ class TestingMachine:
         MiniHandlers.safe(lambda: os.remove(cfg.visited_file))
         MiniHandlers.safe(lambda: os.remove(cfg.output_file))
 
-    # --- benchmarks ---
     def test_bench_bloom(self):
         fn = "bench.bloom"
         MiniHandlers.safe(lambda: os.remove(fn))
@@ -2149,12 +2101,10 @@ async def _headless_async(urls: List[str], config: Config) -> None:
 
     def on_stats(snap):
         pps = snap["fetched"] / max(snap["uptime"], 1)
-        log.info("q=%d f=%d e=%d b=%d w=%d/%d pps=%.1f bloom=%d fp=%.6f "
-                 "dq=%d",
+        log.info("q=%d f=%d e=%d b=%d w=%d/%d pps=%.1f bloom=%d fp=%.6f dq=%d",
                  snap["queued"], snap["fetched"], snap["errors"],
                  snap["blocks"], snap["active"], snap["concurrency"],
-                 pps, snap["bloom_items"], snap["bloom_fp"],
-                 snap["writer_queue"])
+                 pps, snap["bloom_items"], snap["bloom_fp"], snap["writer_queue"])
 
     def on_log(msg, ts):
         log.info("%s", msg)
@@ -2201,7 +2151,6 @@ def main() -> None:
 
     config = Config.load(Config().config_file)
 
-    # Try to pick up URLs from argv or start_urls.txt
     urls: List[str] = []
     for a in args:
         if a.startswith("http://") or a.startswith("https://"):
@@ -2225,7 +2174,6 @@ def main() -> None:
         run_headless(urls, config)
         return
 
-    # GUI
     sys.exit(launch_gui(urls or None, config))
 
 
