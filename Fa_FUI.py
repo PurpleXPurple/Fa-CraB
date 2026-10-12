@@ -1,25 +1,85 @@
 #!/usr/bin/env python3
 """
-Fa-FUI.py — PyQt6 dashboard. URL box, resume button, live graph, metrics.
-Zero browser engine. Runs the asyncio engine in a QThread.
-Import only when called by Fa-Scrap.py. CLI is --help only.
+Fa-FUI.py — PyQt6 dashboard for Fa-Scrap.
+
+Fixed:
+    - pglive's LivePlotWidget uses addItem(), not add_plot().
+    - Added _attach_plot() defensive helper: tries addItem, add_plot, and
+      plotItem.addItem in that order.
+    - Added HAVE_PGLIVE fallback so the dashboard still runs on a plain
+      pyqtgraph if pglive ever breaks on this Python version.
+    - Hardened thread shutdown and event-loop cleanup.
+
+Zero browser engine. Import only when called by Fa-Scrap.py. CLI is --help only.
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import sys
 import time
+from collections import deque
+from typing import Optional
 
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QLineEdit, QPushButton, QProgressBar, QGroupBox, QFileDialog,
     QStatusBar,
 )
-from pglive.sources.data_connector import DataConnector
-from pglive.sources.live_plot import LiveLinePlot
-from pglive.sources.live_plot_widget import LivePlotWidget
+
+# ── Plot stack: prefer pglive, degrade gracefully to pyqtgraph ───────────────
+try:
+    from pglive.sources.data_connector import DataConnector
+    from pglive.sources.live_plot import LiveLinePlot
+    from pglive.sources.live_plot_widget import LivePlotWidget
+    HAVE_PGLIVE = True
+except Exception as _pglive_err:
+    HAVE_PGLIVE = False
+    _PGLIVE_ERR = _pglive_err
+    import pyqtgraph as pg
+    DataConnector = None       # type: ignore
+    LiveLinePlot = None        # type: ignore
+    LivePlotWidget = None      # type: ignore
+
+
+def _attach_plot(widget, plot) -> bool:
+    """
+    Attach a plot to a pyqtgraph/pglive widget across API variants.
+
+    Tries in order:
+        1. widget.addItem(plot)        # pglive + pyqtgraph canonical
+        2. widget.add_plot(plot)       # older/other pglive forks
+        3. widget.plotItem.addItem(plot)
+        4. widget.getPlotItem().addItem(plot)
+    Returns True on success, False if every path failed.
+    """
+    for name in ("addItem", "add_plot"):
+        method = getattr(widget, name, None)
+        if callable(method):
+            try:
+                method(plot)
+                return True
+            except Exception:
+                continue
+    # Reach into the PlotItem directly
+    plot_item = getattr(widget, "plotItem", None)
+    if plot_item is None:
+        getter = getattr(widget, "getPlotItem", None)
+        if callable(getter):
+            try:
+                plot_item = getter()
+            except Exception:
+                plot_item = None
+    if plot_item is not None:
+        try:
+            plot_item.addItem(plot)
+            return True
+        except Exception:
+            pass
+    return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,32 +93,50 @@ class ScraperThread(QThread):
     def __init__(self, engine, seeds: list[str]):
         super().__init__()
         self.engine = engine
-        self.seeds = seeds
+        self.seeds = list(seeds or [])
         self._stop = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def stop(self):
         self._stop = True
-        try:
-            loop = self.engine._loop_ref  # type: ignore[attr-defined]
-            if loop and loop.is_running():
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
                 loop.call_soon_threadsafe(self.engine._shutdown.set)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     def run(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        self.engine._loop_ref = loop  # type: ignore[attr-defined]
+        self._loop = loop
+        try:
+            self.engine._loop_ref = loop
+        except Exception:
+            pass
         try:
             loop.run_until_complete(self._loop_coro())
         except Exception as e:
-            self.log_line.emit(f"engine error: {e}")
-        finally:
             try:
-                loop.run_until_complete(asyncio.sleep(0))
+                self.log_line.emit(f"engine error: {e}")
             except Exception:
                 pass
-            loop.close()
+        finally:
+            try:
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                loop.close()
+            except Exception:
+                pass
+            self._loop = None
 
     async def _loop_coro(self):
         monitor = asyncio.create_task(self._monitor())
@@ -70,12 +148,20 @@ class ScraperThread(QThread):
                 await monitor
             except asyncio.CancelledError:
                 pass
-        self.finished_run.emit(self.engine.metrics())
+            except Exception:
+                pass
+        try:
+            self.finished_run.emit(self.engine.metrics())
+        except Exception:
+            pass
 
     async def _monitor(self):
         while not self._stop:
             await asyncio.sleep(0.25)
-            self.metrics_updated.emit(self.engine.metrics())
+            try:
+                self.metrics_updated.emit(self.engine.metrics())
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -85,22 +171,30 @@ class Dashboard(QMainWindow):
     def __init__(self, engine, initial_url: str = "", autostart: bool = False):
         super().__init__()
         self.engine = engine
-        self.thread: ScraperThread | None = None
+        self.thread: Optional[ScraperThread] = None
         self.setWindowTitle("Fa-Scrap")
         self.resize(1200, 760)
+
+        # Plain-pyqtgraph fallback state
+        self._fb_x: deque[float] = deque(maxlen=600)
+        self._fb_y: deque[float] = deque(maxlen=600)
+        self._fb_plot = None
+        self._fb_curve = None
+
         self._build_ui()
+
         if initial_url:
             self.url_input.setText(initial_url)
             if autostart:
                 self._start()
 
-    # ── UI ───────────────────────────────────────────────────────────────────
+    # ── UI construction ──────────────────────────────────────────────────────
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # URL row
+        # ── URL row ─────────────────────────────────────────────────────────
         url_row = QHBoxLayout()
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Paste a URL and press Enter…")
@@ -119,25 +213,67 @@ class Dashboard(QMainWindow):
         url_row.addWidget(self.btn_stop)
         root.addLayout(url_row)
 
-        # Body: graph + metrics
+        # ── Body: graph + metrics ───────────────────────────────────────────
         body = QHBoxLayout()
-        self.graph = LivePlotWidget(title="Pages / second")
-        self.graph.setBackground("w")
-        self.plot = LiveLinePlot()
-        self.graph.add_plot(self.plot)
-        self.connector = DataConnector(self.plot, max_points=600, update_rate=100)
-        body.addWidget(self.graph, stretch=2)
+        body.addWidget(self._build_graph(), stretch=2)
         body.addWidget(self._build_metrics(), stretch=1)
         root.addLayout(body, stretch=1)
 
-        # Status
+        # ── Status bar ──────────────────────────────────────────────────────
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Idle — paste a URL.")
+        if HAVE_PGLIVE:
+            self.status.showMessage("Idle — paste a URL.")
+        else:
+            self.status.showMessage(
+                f"Idle — pglive unavailable ({_PGLIVE_ERR!s:.60}); "
+                f"using fallback plotter.")
+
+    def _build_graph(self) -> QWidget:
+        """Build the graph widget. pglive preferred, pyqtgraph fallback."""
+        if HAVE_PGLIVE:
+            try:
+                self.graph = LivePlotWidget(title="Pages / second")
+                try:
+                    self.graph.setBackground("w")
+                except Exception:
+                    pass
+                self.plot = LiveLinePlot()
+                attached = _attach_plot(self.graph, self.plot)
+                if not attached:
+                    raise RuntimeError("could not attach plot to LivePlotWidget")
+                try:
+                    self.connector = DataConnector(
+                        self.plot, max_points=600, update_rate=100)
+                except TypeError:
+                    # Older pglive signature
+                    self.connector = DataConnector(self.plot)
+                return self.graph
+            except Exception as e:
+                # Fall through to plain pyqtgraph
+                self.status and None  # status not built yet; ignore
+                print(f"[Fa-FUI] pglive setup failed ({e}); using pyqtgraph.",
+                      file=sys.stderr)
+
+        # Fallback: plain pyqtgraph
+        self.graph = pg.PlotWidget(title="Pages / second")
+        try:
+            self.graph.setBackground("w")
+        except Exception:
+            pass
+        try:
+            self.graph.showGrid(x=True, y=True, alpha=0.3)
+        except Exception:
+            pass
+        self._fb_plot = self.graph.plot([], [], pen=pg.mkPen("#1f77b4", width=2))
+        self.connector = None
+        self.plot = self._fb_plot
+        return self.graph
 
     def _build_metrics(self) -> QGroupBox:
         box = QGroupBox("Metrics")
         grid = QGridLayout(box)
+
         self.lbl_success = QLabel("0")
         self.lbl_fail = QLabel("0")
         self.lbl_skip = QLabel("0")
@@ -148,6 +284,7 @@ class Dashboard(QMainWindow):
         self.lbl_conc = QLabel("0")
         self.lbl_queue = QLabel("0")
         self.lbl_uptime = QLabel("0s")
+
         rows = [
             ("Success", self.lbl_success),
             ("Failures", self.lbl_fail),
@@ -166,15 +303,17 @@ class Dashboard(QMainWindow):
             grid.addWidget(k, i, 0)
             grid.addWidget(w, i, 1)
             w.setFont(font)
+
         self.fail_bar = QProgressBar()
         self.fail_bar.setRange(0, 100)
+        self.fail_bar.setValue(0)
         self.fail_bar.setFormat("Failure Rate: %p%")
         grid.addWidget(self.fail_bar, len(rows), 0, 1, 2)
         return box
 
     # ── Actions ──────────────────────────────────────────────────────────────
     def _start(self):
-        if self.thread is not None:
+        if self.thread is not None and self.thread.isRunning():
             return
         url = self.url_input.text().strip()
         if not url:
@@ -183,11 +322,17 @@ class Dashboard(QMainWindow):
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
             self.url_input.setText(url)
+
+        # Reset fallback buffers between runs
+        self._fb_x.clear()
+        self._fb_y.clear()
+
         self.thread = ScraperThread(self.engine, [url])
         self.thread.metrics_updated.connect(self._on_metrics)
         self.thread.finished_run.connect(self._on_finished)
-        self.thread.log_line.connect(lambda m: self.status.showMessage(m))
+        self.thread.log_line.connect(self._on_log)
         self.thread.start()
+
         self.btn_go.setEnabled(False)
         self.btn_stop.setEnabled(True)
         self.status.showMessage(f"Running: {url}")
@@ -204,9 +349,16 @@ class Dashboard(QMainWindow):
             return
         loop = asyncio.new_event_loop()
         try:
-            added = loop.run_until_complete(self.engine.resume.load_external(path))
+            added = loop.run_until_complete(
+                self.engine.resume.load_external(path))
+        except Exception as e:
+            self.status.showMessage(f"Resume load failed: {e}")
+            return
         finally:
-            loop.close()
+            try:
+                loop.close()
+            except Exception:
+                pass
         self.status.showMessage(f"Resume loaded: {added} new known URLs.")
 
     # ── Slots ────────────────────────────────────────────────────────────────
@@ -221,10 +373,26 @@ class Dashboard(QMainWindow):
         self.lbl_conc.setText(str(m.get("concurrency", 0)))
         self.lbl_queue.setText(str(m.get("queued", 0)))
         self.lbl_uptime.setText(f"{m.get('uptime', 0):.0f}s")
+
         total = m.get("success", 0) + m.get("failures", 0)
         if total > 0:
             self.fail_bar.setValue(int(100 * m.get("failures", 0) / total))
-        self.connector.cb_append_data_point(float(m.get("pages_per_sec", 0.0)), time.time())
+
+        pps = float(m.get("pages_per_sec", 0.0))
+        now = time.time()
+
+        if self.connector is not None:
+            try:
+                self.connector.cb_append_data_point(pps, now)
+            except Exception:
+                pass
+        elif self._fb_plot is not None:
+            self._fb_x.append(now)
+            self._fb_y.append(pps)
+            try:
+                self._fb_plot.setData(list(self._fb_x), list(self._fb_y))
+            except Exception:
+                pass
 
     def _on_finished(self, m: dict):
         self.status.showMessage(
@@ -235,15 +403,21 @@ class Dashboard(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.thread = None
 
+    def _on_log(self, msg: str):
+        self.status.showMessage(msg)
+
     def closeEvent(self, event):
         if self.thread is not None:
-            self.thread.stop()
-            self.thread.wait(3000)
+            try:
+                self.thread.stop()
+                self.thread.wait(3000)
+            except Exception:
+                pass
         event.accept()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ENTRY (called by Fa-Scrap.py)
+# LAUNCH
 # ══════════════════════════════════════════════════════════════════════════════
 def launch(engine, initial_url: str = "", autostart: bool = False) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
@@ -252,10 +426,15 @@ def launch(engine, initial_url: str = "", autostart: bool = False) -> int:
     return app.exec()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI (--help only)
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
     p = argparse.ArgumentParser(
         prog="Fa-FUI.py",
-        description="Fa-Scrap PyQt6 dashboard. Launched by Fa-Scrap.py. CLI is --help only.",
+        description=(
+            "Fa-Scrap PyQt6 dashboard. Launched by Fa-Scrap.py. CLI is --help only."
+        ),
     )
     p.print_help()
 
