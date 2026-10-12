@@ -2115,7 +2115,7 @@ def run_gui() -> int:
     app.setStyleSheet(DARK_STYLESHEET)
 
     font = QFont("JetBrains Mono", 10)
-    available_fonts = QFontDatabase().families()
+    available_fonts = QFontDatabase.families()
     if "JetBrains Mono" not in available_fonts:
         for fallback in ("Cascadia Mono", "Consolas", "Menlo", "Monospace"):
             if fallback in available_fonts:
