@@ -428,11 +428,7 @@ def _probe_impersonations():
     candidates = list({b['key'] for b in _UA_BUNDLES})
     for key in candidates:
         try:
-            s = SessionCls(impersonate=key, timeout=2)
-            try:
-                s.close() if not asyncio.iscoroutinefunction(s.close) else None
-            except Exception:
-                pass
+            SessionCls(impersonate=key, timeout=2)
             working.add(key)
         except Exception:
             _BAD_IMPERSONATIONS.add(key)
@@ -719,6 +715,7 @@ _MAIN_SELECTORS = (
     'article', 'main', '[role="main"]', '#content',
     '.post-content', '.entry-content', '.article-content',
     '.article-body', '.story-body', '.content-body',
+    '.md-content', '.md-main__inner',
 )
 
 _MAIN_XPATHS = (
@@ -729,6 +726,7 @@ _MAIN_XPATHS = (
     '//*[contains(@class, "article-body")]',
     '//*[contains(@class, "story-body")]',
     '//*[contains(@class, "content-body")]',
+    '//*[contains(@class, "md-content")]',
 )
 
 _WS_RE = re.compile(r'[^\S\n]+')
@@ -776,17 +774,22 @@ _JSONLD_RE = re.compile(
 )
 
 _CHALLENGE_TITLE_RE = re.compile(
-    r'just a moment|attention required|checking your browser|verifying you are human|'
-    r'ddos protection|cf-browser-verification|cf_chl_|enable javascript and cookies',
+    r'^\s*(just a moment|attention required|checking your browser|'
+    r'verifying you are human|ddos protection|one more step|'
+    r'enable javascript and cookies)',
     re.IGNORECASE,
 )
 
-_CHALLENGE_BODY_MARKERS = (
-    b'cf-chl-', b'__cf_chl_', b'turnstile', b'challenge-platform',
-    b'cf_chl_opt', b'/cdn-cgi/challenge-platform', b'cf-please-wait',
-    b'<title>just a moment', b'<title>attention required',
-    b'checking your browser', b'verifying you are human',
-    b'cf-challenge', b'cloudflare ray id',
+_CHALLENGE_STRONG_MARKERS = (
+    b'<div id="cf-chl-widget',
+    b'<form id="challenge-form"',
+    b'__cf_chl_rt_tk',
+    b'cf-please-wait',
+    b'<span id="challenge-error-text">',
+    b'<title>just a moment',
+    b'<title>attention required',
+    b'<title>checking your browser',
+    b'<title>one more step',
 )
 
 _CHALLENGE_STATUS = (403, 503, 429)
@@ -799,22 +802,28 @@ def _is_challenge_response(raw_text, raw_bytes, status, headers):
             return True
     except Exception:
         pass
-    try:
-        server = (headers.get('server') or headers.get('Server') or '').lower()
-        is_cf = 'cloudflare' in server
-    except Exception:
-        is_cf = False
-    if raw_bytes:
-        head = raw_bytes[:40_000].lower()
-        for marker in _CHALLENGE_BODY_MARKERS:
-            if marker in head:
-                return True
+
     if raw_text:
         m = re.search(r'<title[^>]*>([^<]{1,200})</title>', raw_text, re.IGNORECASE)
-        if m and _CHALLENGE_TITLE_RE.search(m.group(1)):
+        if m and _CHALLENGE_TITLE_RE.search(m.group(1).strip()):
             return True
-    if is_cf and status in _CHALLENGE_STATUS:
-        return True
+
+    if raw_bytes:
+        blen = len(raw_bytes)
+        if blen < 60000:
+            head = raw_bytes[:40000].lower()
+            for marker in _CHALLENGE_STRONG_MARKERS:
+                if marker in head:
+                    return True
+
+    if status in _CHALLENGE_STATUS and raw_bytes and len(raw_bytes) < 25000:
+        try:
+            server = (headers.get('server') or headers.get('Server') or '').lower()
+            if 'cloudflare' in server:
+                return True
+        except Exception:
+            pass
+
     return False
 
 
@@ -1639,8 +1648,6 @@ class Crawler:
             xml = await self._standalone_fetch(sm_url, timeout=20)
             if not xml:
                 continue
-            if sm_url.endswith('.gz') or xml[:2] == '\x1f\x8b':
-                continue
             low_xml = xml[:3000].lower()
             locs = _SITEMAP_LOC_RE.findall(xml)
             if '<sitemapindex' in low_xml:
@@ -1672,17 +1679,20 @@ class Crawler:
             )
             if resp.status_code != 200:
                 self.flaresolverr_available = False
+                print('[flare] endpoint not reachable (FlareSolverr not running?)', file=sys.stderr)
                 return None
             data = resp.json()
             if data.get('status') != 'ok':
                 self.flaresolverr_available = False
+                print(f'[flare] error: {data.get("message", "unknown")}', file=sys.stderr)
                 return None
             self.flaresolverr_available = True
             solution = data.get('solution') or {}
             html = solution.get('response')
             return html if isinstance(html, str) and html else None
-        except Exception:
+        except Exception as e:
             self.flaresolverr_available = False
+            print(f'[flare] {type(e).__name__}: {e}', file=sys.stderr)
             return None
 
     async def run(self, seed):
@@ -1959,7 +1969,7 @@ class Crawler:
 
             is_chal = _is_challenge_response(raw or '', body_bytes, status, resp_headers)
 
-            if is_chal or (host in self.challenged_hosts and host not in self.resolved_hosts):
+            if is_chal and self.flaresolverr_available is not False:
                 self.challenges_total += 1
                 self.challenged_hosts.add(host)
                 async with self.flare_sem:
@@ -1971,9 +1981,8 @@ class Crawler:
                     status = 200
                     if not ctype:
                         ctype = 'text/html'
-                else:
-                    self._log_drop('challenge-unsolved', url)
-                    return
+            elif is_chal and host not in self.resolved_hosts:
+                self.challenges_total += 1
 
             if status != 200:
                 if status in (403, 429, 502, 503, 520, 521, 522, 523, 524):
@@ -2003,18 +2012,6 @@ class Crawler:
                     return
                 if len(raw) > CONFIG['max_html_bytes']:
                     raw = raw[:CONFIG['max_html_bytes']]
-
-                if _is_challenge_response(raw, raw.encode('utf-8', 'ignore'), 200, resp_headers):
-                    self.challenges_total += 1
-                    self.challenged_hosts.add(host)
-                    async with self.flare_sem:
-                        solved = await self._flaresolverr_fetch(url)
-                    if solved:
-                        self.resolved_hosts.add(host)
-                        raw = solved[:CONFIG['max_html_bytes']]
-                    else:
-                        self._log_drop('challenge-unsolved-200', url)
-                        return
 
                 try:
                     cleaned, links, code = await loop.run_in_executor(
