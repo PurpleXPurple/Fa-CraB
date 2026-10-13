@@ -14,35 +14,33 @@ from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 
 
 CONFIG = {
-    'initial_concurrency': 400,
+    'max_active_hosts': 64,
+    'workers_per_host': 32,
+    'max_concurrency': 4000,
     'min_concurrency': 128,
-    'max_concurrency': 3000,
-    'session_pool_size': 48,
-    'rotate_min': 300,
-    'rotate_max': 600,
+    'session_pool_size': 64,
+    'rotate_min': 400,
+    'rotate_max': 800,
     'request_timeout': 12,
-    'max_html_bytes': 1_500_000,
+    'max_html_bytes': 2_000_000,
     'max_binary_bytes': 10_000_000,
     'max_text_chars': 200_000,
     'max_redirects': 5,
-    'queue_high_water': 1_000_000,
+    'queue_high_water': 2_000_000,
+    'max_links_per_page': 20_000,
     'stats_interval': 3.0,
-    'idle_sleep': 0.01,
     'output_file': 'output.json',
-    'bloom_expected': 30_000_000,
+    'bloom_expected': 50_000_000,
     'bloom_error': 0.001,
     'parser_workers': max(8, (os.cpu_count() or 4) * 2),
     'ocr_workers': 4,
-    'ocr_concurrency': 4,
+    'ocr_concurrency': 8,
     'ocr_enabled': True,
     'ocr_min_text_chars': 100,
     'ocr_max_chars': 400_000,
     'ocr_pdf_max_pages': 10,
-    'per_host_base': 64,
-    'per_host_max': 512,
-    'per_host_min': 8,
-    'sitemap_max_count': 50,
-    'sitemap_max_pages': 5000,
+    'host_idle_timeout': 15.0,
+    'dispatch_interval': 0.25,
     'host_403_blacklist_threshold': 5,
     'impersonate_retry_limit': 2,
     'drop_log_limit': 15,
@@ -55,14 +53,14 @@ OCR_POOL = ThreadPoolExecutor(max_workers=CONFIG['ocr_workers'])
 
 
 # ===========================================================================
-# Lazy imports
+# Lazy loaders
 # ===========================================================================
 
 _curl_AsyncSession = None
 _parser_cls = None
 _parser_mode = None
-_pdf_reader_cls = None
-_pdf2image_conv = None
+_pdf_module = None
+_pdf_mode = None
 _pytesseract = None
 _pil_image = None
 
@@ -94,29 +92,34 @@ def _load_parser():
 
 
 def _load_pdf():
-    global _pdf_reader_cls
-    if _pdf_reader_cls is None:
+    """Prefer PyMuPDF (10-30x faster than pypdf, renders pages for OCR natively)."""
+    global _pdf_module, _pdf_mode
+    if _pdf_mode is not None:
+        return _pdf_mode
+    for modname in ('pymupdf', 'fitz'):
         try:
-            import pypdf
-            _pdf_reader_cls = pypdf.PdfReader
+            mod = __import__(modname)
+            _pdf_module = mod
+            _pdf_mode = 'pymupdf'
+            return _pdf_mode
         except ImportError:
-            try:
-                import PyPDF2
-                _pdf_reader_cls = PyPDF2.PdfReader
-            except ImportError:
-                _pdf_reader_cls = False
-    return _pdf_reader_cls
-
-
-def _load_pdf_render():
-    global _pdf2image_conv
-    if _pdf2image_conv is None:
-        try:
-            from pdf2image import convert_from_bytes
-            _pdf2image_conv = convert_from_bytes
-        except ImportError:
-            _pdf2image_conv = False
-    return _pdf2image_conv
+            continue
+    try:
+        import pypdf as _pypdf
+        _pdf_module = _pypdf
+        _pdf_mode = 'pypdf'
+        return _pdf_mode
+    except ImportError:
+        pass
+    try:
+        import PyPDF2 as _pypdf2
+        _pdf_module = _pypdf2
+        _pdf_mode = 'pypdf'
+        return _pdf_mode
+    except ImportError:
+        pass
+    _pdf_mode = 'none'
+    return _pdf_mode
 
 
 def _load_ocr():
@@ -180,118 +183,73 @@ class BloomFilter:
 
 
 # ===========================================================================
-# Rate limiting — per-host state + adaptive limit
+# Rate limiting — delay + blacklist only (concurrency is worker-count bound)
 # ===========================================================================
 
 class DomainState:
-    __slots__ = ('delay', 'fails', 'last_hit', 'limit', 'success_run',
-                 'consecutive_403', 'blacklisted')
+    __slots__ = ('delay', 'fails', 'last_hit', 'consecutive_403', 'blacklisted')
 
-    def __init__(self, base_limit):
+    def __init__(self):
         self.delay = 0.0
         self.fails = 0
         self.last_hit = 0.0
-        self.limit = base_limit
-        self.success_run = 0
         self.consecutive_403 = 0
         self.blacklisted = False
 
 
 class RateLimitTracker:
-    __slots__ = ('domains', '_lock', 'base_limit', 'min_limit', 'max_limit')
+    __slots__ = ('domains', '_lock')
 
     def __init__(self):
         self.domains = {}
         self._lock = asyncio.Lock()
-        self.base_limit = CONFIG['per_host_base']
-        self.min_limit = CONFIG['per_host_min']
-        self.max_limit = CONFIG['per_host_max']
-
-    def limit_for(self, host):
-        state = self.domains.get(host)
-        return state.limit if state is not None else self.base_limit
 
     def is_blacklisted(self, host):
-        state = self.domains.get(host)
-        return state is not None and state.blacklisted
+        st = self.domains.get(host)
+        return st is not None and st.blacklisted
 
     async def wait(self, host):
-        state = self.domains.get(host)
-        if state is None or state.delay <= 0:
+        st = self.domains.get(host)
+        if st is None or st.delay <= 0:
             return
-        gap = state.delay - (time.monotonic() - state.last_hit)
+        gap = st.delay - (time.monotonic() - st.last_hit)
         if gap > 0:
             await asyncio.sleep(gap)
 
     async def record(self, host, status, retry_after=0.0):
-        state = self.domains.get(host)
-        # Fast path: clean 200, no delay and no prior problems.
-        if status == 200 and retry_after == 0.0 and (state is None or state.delay <= 0.0):
-            if state is None:
+        st = self.domains.get(host)
+        if status == 200 and retry_after == 0.0 and (st is None or st.delay <= 0.0):
+            if st is None:
                 async with self._lock:
-                    state = self.domains.get(host)
-                    if state is None:
-                        state = DomainState(self.base_limit)
-                        self.domains[host] = state
-            state.last_hit = time.monotonic()
-            state.success_run += 1
-            state.consecutive_403 = 0
-            if state.success_run >= 20 and state.limit < self.max_limit:
-                state.success_run = 0
-                state.limit = min(self.max_limit, state.limit * 2)
+                    st = self.domains.get(host)
+                    if st is None:
+                        st = DomainState()
+                        self.domains[host] = st
+            st.last_hit = time.monotonic()
+            st.consecutive_403 = 0
             return
         async with self._lock:
-            state = self.domains.get(host)
-            if state is None:
-                state = DomainState(self.base_limit)
-                self.domains[host] = state
-            state.last_hit = time.monotonic()
+            st = self.domains.get(host)
+            if st is None:
+                st = DomainState()
+                self.domains[host] = st
+            st.last_hit = time.monotonic()
             if retry_after > 0:
-                state.delay = max(state.delay, min(retry_after, 300.0))
+                st.delay = max(st.delay, min(retry_after, 300.0))
             if status in (429, 503, 502, 520, 521, 522, 523, 524):
-                state.fails += 1
-                state.success_run = 0
-                state.limit = max(self.min_limit, state.limit // 2)
-                state.delay = min(180.0, max(0.5, state.delay * 2.0) * random.uniform(0.8, 1.2))
+                st.fails += 1
+                st.delay = min(120.0, max(0.3, st.delay * 2.0) * random.uniform(0.8, 1.2))
             elif status == 403:
-                state.fails += 1
-                state.success_run = 0
-                state.limit = max(self.min_limit, state.limit // 2)
-                state.consecutive_403 += 1
-                if state.consecutive_403 >= CONFIG['host_403_blacklist_threshold']:
-                    state.blacklisted = True
+                st.fails += 1
+                st.consecutive_403 += 1
+                if st.consecutive_403 >= CONFIG['host_403_blacklist_threshold']:
+                    st.blacklisted = True
             elif status == 401:
-                state.fails += 1
-                state.success_run = 0
-                state.limit = max(self.min_limit, state.limit // 2)
-                state.delay = min(90.0, max(0.8, state.delay * 1.6))
+                st.fails += 1
+                st.delay = min(60.0, max(0.5, st.delay * 1.6))
             elif status == 200:
-                state.fails = 0
-                state.delay = max(0.0, state.delay * 0.7 - 0.1)
-
-
-# ===========================================================================
-# Per-host gate — condition-based, blocks cleanly instead of spin-looping
-# ===========================================================================
-
-class HostGate:
-    __slots__ = ('limit', 'inflight', '_cond')
-
-    def __init__(self, limit):
-        self.limit = limit
-        self.inflight = 0
-        self._cond = asyncio.Condition()
-
-    async def acquire(self):
-        async with self._cond:
-            while self.inflight >= self.limit:
-                await self._cond.wait()
-            self.inflight += 1
-
-    async def release(self):
-        async with self._cond:
-            self.inflight -= 1
-            self._cond.notify(1)
+                st.fails = 0
+                st.delay = max(0.0, st.delay * 0.7 - 0.1)
 
 
 # ===========================================================================
@@ -351,7 +309,7 @@ class AdaptiveGate:
 
 
 # ===========================================================================
-# Header spoofing
+# Headers
 # ===========================================================================
 
 _ACCEPT_LANGS = (
@@ -637,10 +595,28 @@ _META_REFRESH_RE = re.compile(r'url\s*=\s*[\'"]?([^\'";]+)', re.IGNORECASE)
 
 _LINK_SELECTOR = (
     'a[href], area[href], iframe[src], frame[src], '
-    'link[rel="next"], link[rel="prev"], link[rel="canonical"], '
-    'link[rel="alternate"], link[rel="amphtml"], '
-    'link[rel="sitemap"], meta[http-equiv="refresh"]'
+    'link[href], source[src], source[srcset], img[srcset], '
+    'meta[http-equiv="refresh"], meta[property="og:url"], '
+    'meta[name="twitter:url"], [data-href], [data-url], [data-link], '
+    '[data-src], [data-lazy-src], [data-original]'
 )
+
+_SRCSET_SPLIT_RE = re.compile(r'\s*,\s*')
+
+# Absolute-URL regex for scanning <script> payloads (Next.js / Nuxt / RSC / etc.)
+_SCRIPT_BLOCK_RE = re.compile(rb'<script\b[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
+_ABS_URL_RE = re.compile(
+    rb'https?://[a-zA-Z0-9][a-zA-Z0-9\-._]{1,253}\.[a-zA-Z]{2,}'
+    rb'[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]{0,1000}',
+    re.IGNORECASE,
+)
+
+# JSON-LD url-bearing keys
+_JSONLD_RE = re.compile(
+    rb'<script[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+_JSONLD_KEYS = frozenset({'url', '@id', 'sameAs', 'href', 'link', 'permalink', 'canonicalUrl'})
 
 
 def _finalize_text(text):
@@ -650,92 +626,195 @@ def _finalize_text(text):
     return text.strip()
 
 
-def _extract_links_selectolax(tree, base_url):
+def _maybe_srcset(val):
+    """Return first URL from a srcset or the value itself."""
+    if not val:
+        return None
+    if ',' in val:
+        best = None
+        best_w = -1.0
+        for part in _SRCSET_SPLIT_RE.split(val):
+            part = part.strip()
+            if not part:
+                continue
+            bits = part.split()
+            u = bits[0]
+            w = 1.0
+            if len(bits) > 1:
+                try:
+                    w = float(bits[1].rstrip('wx'))
+                except Exception:
+                    w = 1.0
+            if w > best_w:
+                best_w = w
+                best = u
+        return best
+    return val
+
+
+def _scan_scripts_for_urls(raw_bytes, base_url, limit):
+    """Bulk-extract absolute URLs from inside <script> blocks."""
+    if b'<script' not in raw_bytes:
+        return ()
+    out = []
+    seen = set()
+    for m in _SCRIPT_BLOCK_RE.finditer(raw_bytes):
+        block = m.group(1)
+        if not block:
+            continue
+        for um in _ABS_URL_RE.finditer(block):
+            try:
+                cand = um.group(0).decode('ascii', 'ignore')
+            except Exception:
+                continue
+            n = normalize(cand, base_url)
+            if n and n not in seen:
+                seen.add(n)
+                out.append(n)
+                if len(out) >= limit:
+                    return tuple(out)
+    return tuple(out)
+
+
+def _scan_jsonld_for_urls(raw_bytes, base_url, limit):
+    if b'ld+json' not in raw_bytes:
+        return ()
+    out = []
+    seen = set()
+    for m in _JSONLD_RE.finditer(raw_bytes):
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            continue
+        stack = [data]
+        depth = 0
+        while stack and depth < 200_000:
+            depth += 1
+            item = stack.pop()
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    if isinstance(v, str) and k in _JSONLD_KEYS:
+                        if v.startswith(('http://', 'https://', '/')):
+                            n = normalize(v, base_url)
+                            if n and n not in seen:
+                                seen.add(n)
+                                out.append(n)
+                                if len(out) >= limit:
+                                    return tuple(out)
+                    elif isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(item, list):
+                stack.extend(item[:1000])
+    return tuple(out)
+
+
+def _extract_links_selectolax(tree, base_url, limit):
     links = []
     seen = set()
     for node in tree.css(_LINK_SELECTOR):
         tag = node.tag
-        val = None
+        attrs = node.attributes
+        candidates = []
         if tag in ('a', 'area'):
-            val = node.attributes.get('href')
+            candidates.append(attrs.get('href'))
         elif tag in ('iframe', 'frame'):
-            val = node.attributes.get('src')
+            candidates.append(attrs.get('src'))
         elif tag == 'link':
-            val = node.attributes.get('href')
+            candidates.append(attrs.get('href'))
+        elif tag == 'source':
+            candidates.append(attrs.get('src'))
+            ss = attrs.get('srcset')
+            if ss:
+                candidates.append(_maybe_srcset(ss))
+        elif tag == 'img':
+            ss = attrs.get('srcset')
+            if ss:
+                candidates.append(_maybe_srcset(ss))
         elif tag == 'meta':
-            content = node.attributes.get('content') or ''
-            mr = _META_REFRESH_RE.search(content)
-            if mr:
-                val = mr.group(1)
-        if not val:
-            continue
-        n = normalize(val, base_url)
-        if n and n not in seen:
-            seen.add(n)
-            links.append(n)
-            if len(links) >= 5000:
-                return tuple(links)
-    for el in tree.css('[data-href],[data-url],[data-link]'):
-        for attr in ('data-href', 'data-url', 'data-link'):
-            val = el.attributes.get(attr)
-            if val:
-                n = normalize(val, base_url)
-                if n and n not in seen:
-                    seen.add(n)
-                    links.append(n)
-                break
-        if len(links) >= 5000:
-            break
+            he = (attrs.get('http-equiv') or '').lower()
+            prop = (attrs.get('property') or attrs.get('name') or '').lower()
+            content = attrs.get('content') or ''
+            if he == 'refresh':
+                mr = _META_REFRESH_RE.search(content)
+                if mr:
+                    candidates.append(mr.group(1))
+            elif prop in ('og:url', 'twitter:url'):
+                candidates.append(content)
+        for attr in ('data-href', 'data-url', 'data-link',
+                     'data-src', 'data-lazy-src', 'data-original'):
+            v = attrs.get(attr)
+            if v:
+                candidates.append(v)
+        for val in candidates:
+            if not val:
+                continue
+            n = normalize(val, base_url)
+            if n and n not in seen:
+                seen.add(n)
+                links.append(n)
+                if len(links) >= limit:
+                    return tuple(links)
     return tuple(links)
 
 
-def _extract_links_lxml(doc, base_url):
+def _extract_links_lxml(doc, base_url, limit):
     links = []
     seen = set()
     for node in doc.iter():
         tag = node.tag
-        val = None
+        if tag is None:
+            continue
+        candidates = []
         if tag in ('a', 'area'):
-            val = node.get('href')
+            candidates.append(node.get('href'))
         elif tag in ('iframe', 'frame'):
-            val = node.get('src')
+            candidates.append(node.get('src'))
         elif tag == 'link':
-            val = node.get('href')
+            candidates.append(node.get('href'))
+        elif tag == 'source':
+            candidates.append(node.get('src'))
+            ss = node.get('srcset')
+            if ss:
+                candidates.append(_maybe_srcset(ss))
+        elif tag == 'img':
+            ss = node.get('srcset')
+            if ss:
+                candidates.append(_maybe_srcset(ss))
         elif tag == 'meta':
             he = (node.get('http-equiv') or '').lower()
+            prop = (node.get('property') or node.get('name') or '').lower()
+            content = node.get('content') or ''
             if he == 'refresh':
-                content = node.get('content') or ''
                 mr = _META_REFRESH_RE.search(content)
                 if mr:
-                    val = mr.group(1)
-        elif tag is not None:
-            for attr in ('data-href', 'data-url', 'data-link'):
-                v = node.get(attr)
-                if v:
-                    val = v
-                    break
-        if not val:
-            continue
-        n = normalize(val, base_url)
-        if n and n not in seen:
-            seen.add(n)
-            links.append(n)
-            if len(links) >= 5000:
-                return tuple(links)
+                    candidates.append(mr.group(1))
+            elif prop in ('og:url', 'twitter:url'):
+                candidates.append(content)
+        for attr in ('data-href', 'data-url', 'data-link',
+                     'data-src', 'data-lazy-src', 'data-original'):
+            v = node.get(attr)
+            if v:
+                candidates.append(v)
+        for val in candidates:
+            if not val:
+                continue
+            n = normalize(val, base_url)
+            if n and n not in seen:
+                seen.add(n)
+                links.append(n)
+                if len(links) >= limit:
+                    return tuple(links)
     return tuple(links)
 
 
 def _meta_text_fallback_selectolax(tree):
-    """Pull og:description / twitter:description / meta description as fallback text."""
     parts = []
-    for sel, attr in (
-        ('meta[property="og:description"]', 'content'),
-        ('meta[name="twitter:description"]', 'content'),
-        ('meta[name="description"]', 'content'),
-    ):
+    for sel in ('meta[property="og:description"]',
+                'meta[name="twitter:description"]',
+                'meta[name="description"]'):
         node = tree.css_first(sel)
         if node:
-            v = (node.attributes.get(attr) or '').strip()
+            v = (node.attributes.get('content') or '').strip()
             if v and v not in parts:
                 parts.append(v)
     return ' '.join(parts)
@@ -743,12 +822,10 @@ def _meta_text_fallback_selectolax(tree):
 
 def _meta_text_fallback_lxml(doc):
     parts = []
-    for xp, attr in (
-        ('//meta[@property="og:description"]', 'content'),
-        ('//meta[@name="twitter:description"]', 'content'),
-        ('//meta[@name="description"]', 'content'),
-    ):
-        r = doc.xpath(xp + '/@' + attr)
+    for xp in ('//meta[@property="og:description"]/@content',
+               '//meta[@name="twitter:description"]/@content',
+               '//meta[@name="description"]/@content'):
+        r = doc.xpath(xp)
         if r:
             v = (r[0] or '').strip()
             if v and v not in parts:
@@ -756,7 +833,7 @@ def _meta_text_fallback_lxml(doc):
     return ' '.join(parts)
 
 
-def _parse_selectolax(raw, base_url, cfg):
+def _parse_selectolax(raw, raw_bytes, base_url, cfg):
     try:
         tree = _parser_cls(raw)
     except Exception:
@@ -775,7 +852,20 @@ def _parse_selectolax(raw, base_url, cfg):
         if og:
             title = (og.attributes.get('content') or '')[:200]
 
-    links = _extract_links_selectolax(tree, base_url)
+    limit = cfg['max_links_per_page']
+    links = list(_extract_links_selectolax(tree, base_url, limit))
+    if len(links) < limit:
+        seen = set(links)
+        for extra in _scan_jsonld_for_urls(raw_bytes, base_url, limit - len(links)):
+            if extra not in seen:
+                seen.add(extra)
+                links.append(extra)
+    if len(links) < limit:
+        seen = set(links)
+        for extra in _scan_scripts_for_urls(raw_bytes, base_url, limit - len(links)):
+            if extra not in seen:
+                seen.add(extra)
+                links.append(extra)
 
     content = None
     for sel in _MAIN_SELECTORS:
@@ -796,21 +886,17 @@ def _parse_selectolax(raw, base_url, cfg):
         text = text[:cfg['max_text_chars']]
     text = _finalize_text(text)
 
-    # SPA fallback: if the main content was too thin, grab meta description.
     if len(text) < cfg['min_text_chars']:
         meta = _meta_text_fallback_selectolax(tree)
         if len(meta) > len(text):
             text = meta
 
     if not text and not title:
-        return None, links
-    if len(text) < cfg['min_text_chars'] and not title:
-        return None, links
-
-    return (title or '[untitled]', text), links
+        return None, tuple(links)
+    return (title or '[untitled]', text), tuple(links)
 
 
-def _parse_lxml(raw, base_url, cfg):
+def _parse_lxml(raw, raw_bytes, base_url, cfg):
     try:
         doc = _parser_cls.document_fromstring(raw, base_url=base_url)
     except Exception:
@@ -831,7 +917,20 @@ def _parse_lxml(raw, base_url, cfg):
         if og:
             title = og[0][:200]
 
-    links = _extract_links_lxml(doc, base_url)
+    limit = cfg['max_links_per_page']
+    links = list(_extract_links_lxml(doc, base_url, limit))
+    if len(links) < limit:
+        seen = set(links)
+        for extra in _scan_jsonld_for_urls(raw_bytes, base_url, limit - len(links)):
+            if extra not in seen:
+                seen.add(extra)
+                links.append(extra)
+    if len(links) < limit:
+        seen = set(links)
+        for extra in _scan_scripts_for_urls(raw_bytes, base_url, limit - len(links)):
+            if extra not in seen:
+                seen.add(extra)
+                links.append(extra)
 
     content = None
     for xp in _MAIN_XPATHS:
@@ -860,31 +959,57 @@ def _parse_lxml(raw, base_url, cfg):
             text = meta
 
     if not text and not title:
-        return None, links
-    if len(text) < cfg['min_text_chars'] and not title:
-        return None, links
-
-    return (title or '[untitled]', text), links
+        return None, tuple(links)
+    return (title or '[untitled]', text), tuple(links)
 
 
 def _parse_and_extract(raw, base_url):
     cfg = CONFIG
+    raw_bytes = raw.encode('utf-8', 'ignore') if isinstance(raw, str) else raw
     if _parser_mode == 'lexbor':
-        return _parse_selectolax(raw, base_url, cfg)
-    return _parse_lxml(raw, base_url, cfg)
+        return _parse_selectolax(raw, raw_bytes, base_url, cfg)
+    return _parse_lxml(raw, raw_bytes, base_url, cfg)
 
 
 # ===========================================================================
-# Binary extraction (PDF + images)
+# Binary extraction — PyMuPDF first, pypdf fallback; native OCR rendering
 # ===========================================================================
 
 def _pdf_extract_text(content_bytes):
-    PdfReader = _load_pdf()
-    if not PdfReader:
+    mode = _load_pdf()
+    if mode == 'none':
         return None
+    if mode == 'pymupdf':
+        try:
+            doc = _pdf_module.open(stream=content_bytes, filetype='pdf')
+            try:
+                title = ''
+                try:
+                    meta = doc.metadata or {}
+                    title = meta.get('title', '') or ''
+                except Exception:
+                    pass
+                parts = []
+                n = min(len(doc), 500)
+                for i in range(n):
+                    try:
+                        t = doc[i].get_text()
+                        if t:
+                            parts.append(t)
+                    except Exception:
+                        continue
+                return title, '\n\n'.join(parts)
+            finally:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+    # pypdf / PyPDF2
     try:
         from io import BytesIO
-        reader = PdfReader(BytesIO(content_bytes))
+        reader = _pdf_module.PdfReader(BytesIO(content_bytes))
         title = ''
         try:
             meta = reader.metadata
@@ -920,17 +1045,31 @@ def _image_ocr_pil(img):
 
 
 def _pdf_ocr(content_bytes):
-    conv = _load_pdf_render()
-    if not conv or not _load_ocr():
+    """Render PDF pages directly with PyMuPDF — no pdf2image/poppler needed."""
+    if _load_pdf() != 'pymupdf' or not _load_ocr():
         return None
     try:
-        images = conv(content_bytes, dpi=200, fmt='png')
-        parts = []
-        for i in range(min(len(images), CONFIG['ocr_pdf_max_pages'])):
-            t = _image_ocr_pil(images[i])
-            if t:
-                parts.append(t)
-        return '\n\n'.join(parts)
+        from io import BytesIO
+        doc = _pdf_module.open(stream=content_bytes, filetype='pdf')
+        try:
+            parts = []
+            n = min(len(doc), CONFIG['ocr_pdf_max_pages'])
+            for i in range(n):
+                try:
+                    pix = doc[i].get_pixmap(dpi=200)
+                    png = pix.tobytes('png')
+                    img = _pil_image.open(BytesIO(png))
+                    t = _image_ocr_pil(img)
+                    if t:
+                        parts.append(t)
+                except Exception:
+                    continue
+            return '\n\n'.join(parts)
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
     except Exception:
         return None
 
@@ -980,7 +1119,7 @@ def _extract_binary(content_bytes, content_type, url):
 
 
 # ===========================================================================
-# Bloom prefill (resume-safe)
+# Bloom prefill
 # ===========================================================================
 
 def _prefill_bloom_from_output(bloom):
@@ -1018,7 +1157,7 @@ def _prefill_bloom_from_output(bloom):
 
 
 # ===========================================================================
-# Challenge detection + retry-after + sitemaps
+# Challenge + retry-after + sitemap
 # ===========================================================================
 
 _CHALLENGE_MARKERS = (
@@ -1073,31 +1212,41 @@ _SITEMAP_LOC_RE = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.IGNORECASE)
 
 
 # ===========================================================================
-# Crawler
+# Crawler — domain-scoped worker groups with dynamic lifecycle
 # ===========================================================================
 
 class Crawler:
     __slots__ = (
-        'bloom', 'queue', 'host_gates', 'pool', 'gate', 'rate_limiter',
+        'bloom', 'host_queues', 'host_workers', 'host_inflight',
+        'host_last_active', 'host_retire', 'active_hosts', 'dispatch_lock',
+        'pool', 'gate', 'rate_limiter',
         'written', 'fetched', 'dropped', 'zero_link_pages', 'errors',
-        'stop_flag', 'out_fd', 'stats_task', 'start_time',
-        'last_report_time', 'last_report_written', 'seed', 'seed_host',
-        'ocr_sem', 'challenges_total', 'blacklisted_hosts',
-        'drop_log_count', 'drop_reasons', 'impersonate_errors',
-        'queue_event',
+        'stop_flag', 'out_fd', 'stats_task', 'dispatcher_task',
+        'start_time', 'last_report_time', 'last_report_written',
+        'seed', 'seed_host', 'ocr_sem', 'challenges_total',
+        'blacklisted_hosts', 'drop_log_count', 'drop_reasons',
+        'impersonate_errors',
     )
 
     def __init__(self):
         self.bloom = BloomFilter(CONFIG['bloom_expected'], CONFIG['bloom_error'])
-        self.queue = deque()
-        self.host_gates = {}
+        # Domain-scoped queues and worker groups
+        self.host_queues = {}          # host -> deque[(url, referer, depth)]
+        self.host_workers = {}         # host -> list[Task]
+        self.host_inflight = {}        # host -> int
+        self.host_last_active = {}     # host -> monotonic
+        self.host_retire = set()       # hosts marked for retirement
+        self.active_hosts = 0
+        self.dispatch_lock = asyncio.Lock()
+
         self.pool = None
         self.gate = AdaptiveGate(
-            CONFIG['initial_concurrency'],
+            CONFIG['max_active_hosts'] * CONFIG['workers_per_host'],
             CONFIG['min_concurrency'],
             CONFIG['max_concurrency'],
         )
         self.rate_limiter = RateLimitTracker()
+
         self.written = 0
         self.fetched = 0
         self.dropped = 0
@@ -1106,6 +1255,7 @@ class Crawler:
         self.stop_flag = False
         self.out_fd = -1
         self.stats_task = None
+        self.dispatcher_task = None
         self.start_time = time.time()
         self.last_report_time = self.start_time
         self.last_report_written = 0
@@ -1117,7 +1267,8 @@ class Crawler:
         self.drop_log_count = 0
         self.drop_reasons = {}
         self.impersonate_errors = 0
-        self.queue_event = asyncio.Event()
+
+    # ------------------------------------------------------------------ utils
 
     def _log_drop(self, reason, url):
         self.dropped += 1
@@ -1126,16 +1277,110 @@ class Crawler:
             self.drop_log_count += 1
             print(f'[drop:{reason}] {url[:100]}', file=sys.stderr)
 
-    def _host_gate(self, host):
-        g = self.host_gates.get(host)
-        if g is None:
-            g = HostGate(self.rate_limiter.limit_for(host))
-            self.host_gates[host] = g
-        return g
+    def _enqueue(self, url, referer, depth):
+        h = host_of(url)
+        if not h:
+            return False
+        q = self.host_queues.get(h)
+        if q is None:
+            q = deque()
+            self.host_queues[h] = q
+        q.append((url, referer, depth))
+        return True
 
-    def _enqueue(self, items):
-        self.queue.extend(items)
-        self.queue_event.set()
+    def _enqueue_many(self, links, referer, depth):
+        added = 0
+        bl = self.bloom
+        for link in links:
+            if link in bl:
+                continue
+            bl.add(link)
+            if self._enqueue(link, referer, depth):
+                added += 1
+                if len(self.host_queues) > 500_000:
+                    break
+        return added
+
+    # ----------------------------------------------------- dispatcher / spawn
+
+    async def _dispatcher(self):
+        interval = CONFIG['dispatch_interval']
+        while not self.stop_flag:
+            async with self.dispatch_lock:
+                now = time.monotonic()
+
+                # Mark idle hosts for retirement
+                for host in list(self.host_workers.keys()):
+                    if host in self.host_retire:
+                        continue
+                    if self.host_inflight.get(host, 0) > 0:
+                        continue
+                    if self.host_queues.get(host):
+                        continue
+                    if now - self.host_last_active.get(host, now) > CONFIG['host_idle_timeout']:
+                        self.host_retire.add(host)
+
+                # Cleanup finished worker groups
+                for host in list(self.host_retire):
+                    workers = self.host_workers.get(host, [])
+                    alive = [w for w in workers if not w.done()]
+                    if not alive:
+                        self.host_workers.pop(host, None)
+                        self.host_retire.discard(host)
+                        self.active_hosts -= 1
+                    else:
+                        self.host_workers[host] = alive
+
+                # Spawn worker groups for hosts with pending work
+                for host, q in list(self.host_queues.items()):
+                    if not q or host in self.host_workers:
+                        continue
+                    if self.active_hosts >= CONFIG['max_active_hosts']:
+                        break
+                    self._spawn_host(host)
+
+            await asyncio.sleep(interval)
+
+    def _spawn_host(self, host):
+        n = CONFIG['workers_per_host']
+        workers = [asyncio.create_task(self._host_worker(host, i)) for i in range(n)]
+        self.host_workers[host] = workers
+        self.host_last_active[host] = time.monotonic()
+        self.active_hosts += 1
+        self.host_retire.discard(host)
+
+    async def _host_worker(self, host, wid):
+        empty_streak = 0
+        while not self.stop_flag and host not in self.host_retire:
+            q = self.host_queues.get(host)
+            if not q:
+                empty_streak += 1
+                if empty_streak > 8:
+                    return
+                await asyncio.sleep(0.5)
+                continue
+            empty_streak = 0
+            try:
+                url, referer, depth = q.popleft()
+            except IndexError:
+                continue
+
+            if self.rate_limiter.is_blacklisted(host):
+                self.blacklisted_hosts.add(host)
+                continue
+
+            self.host_inflight[host] = self.host_inflight.get(host, 0) + 1
+            try:
+                await self._process(url, referer, depth, host)
+            except Exception as e:
+                self.errors += 1
+                if self.errors <= 20:
+                    print(f'[w{host}:{wid}] {url[:80]}: {type(e).__name__}: {e}', file=sys.stderr)
+            finally:
+                self.host_inflight[host] = self.host_inflight.get(host, 1) - 1
+                self.host_last_active[host] = time.monotonic()
+
+    # -------------------------------------------------------- standalone fetch
 
     async def _standalone_fetch(self, url, timeout=15):
         SessionCls = _load_session_cls()
@@ -1157,7 +1402,6 @@ class Crawler:
     async def _seed_sitemaps(self, seed_url):
         parsed = urlparse(seed_url)
         base = f'{parsed.scheme}://{parsed.netloc}'
-
         robots = await self._standalone_fetch(f'{base}/robots.txt', timeout=15)
 
         sitemap_urls = []
@@ -1168,15 +1412,14 @@ class Crawler:
                     sm = line[8:].strip()
                     if sm.startswith(('http://', 'https://')):
                         sitemap_urls.append(sm)
-
         if not sitemap_urls:
             sitemap_urls = [f'{base}/sitemap.xml', f'{base}/sitemap_index.xml']
 
         seen_sitemaps = set()
         pages_added = 0
-        pending = deque(sitemap_urls[:CONFIG['sitemap_max_count']])
-        max_sitemaps = CONFIG['sitemap_max_count']
-        max_pages = CONFIG['sitemap_max_pages']
+        pending = deque(sitemap_urls[:CONFIG.get('sitemap_max_count', 50)])
+        max_sitemaps = CONFIG.get('sitemap_max_count', 50)
+        max_pages = CONFIG.get('sitemap_max_pages', 5000)
 
         while pending and len(seen_sitemaps) < max_sitemaps and pages_added < max_pages:
             sm_url = pending.popleft()
@@ -1197,13 +1440,13 @@ class Crawler:
                     n = normalize(loc)
                     if n and n not in self.bloom:
                         self.bloom.add(n)
-                        self.queue.append((n, seed_url, 1))
+                        self._enqueue(n, seed_url, 1)
                         pages_added += 1
                         if pages_added >= max_pages:
                             break
-        if pages_added:
-            self.queue_event.set()
         print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages queued', file=sys.stderr)
+
+    # ------------------------------------------------------------- main loop
 
     async def run(self, seed):
         self.seed = seed
@@ -1211,7 +1454,7 @@ class Crawler:
 
         mode = _load_parser()
         if mode == 'none':
-            print('[!] no HTML parser available (pip install selectolax)', file=sys.stderr)
+            print('[!] no HTML parser (pip install selectolax)', file=sys.stderr)
             return
 
         keys = _available_impersonations()
@@ -1221,7 +1464,7 @@ class Crawler:
 
         _prefill_bloom_from_output(self.bloom)
         self.bloom.add(seed)
-        self.queue.append((seed, '', 0))
+        self._enqueue(seed, '', 0)
 
         self.ocr_sem = asyncio.Semaphore(CONFIG['ocr_concurrency'])
         self.pool = SessionPool(CONFIG['session_pool_size'], keys)
@@ -1234,16 +1477,16 @@ class Crawler:
         )
 
         ocr_ready = bool(_load_ocr() and CONFIG['ocr_enabled'])
-        pdf_ready = bool(_load_pdf())
+        pdf_mode = _load_pdf()
         engine = 'lexbor' if mode == 'lexbor' else 'lxml'
 
-        print(f'[Nexus] seed:      {seed}', file=sys.stderr)
-        print(f'[Nexus] output:    {OUTPUT_FILE.resolve()}', file=sys.stderr)
-        print(f'[Nexus] engine:    {engine}  parsers={CONFIG["parser_workers"]}', file=sys.stderr)
-        print(f'[Nexus] workers:   {CONFIG["initial_concurrency"]}  gate={CONFIG["min_concurrency"]}-{CONFIG["max_concurrency"]}', file=sys.stderr)
-        print(f'[Nexus] sessions:  {CONFIG["session_pool_size"]}  impersonate={len(keys)}', file=sys.stderr)
-        print(f'[Nexus] per-host:  base={CONFIG["per_host_base"]}  max={CONFIG["per_host_max"]}', file=sys.stderr)
-        print(f'[Nexus] pdf:       {"pypdf" if pdf_ready else "off"}   ocr: {"on" if ocr_ready else "off"}', file=sys.stderr)
+        print(f'[Nexus] seed:        {seed}', file=sys.stderr)
+        print(f'[Nexus] output:      {OUTPUT_FILE.resolve()}', file=sys.stderr)
+        print(f'[Nexus] engine:      {engine}  parsers={CONFIG["parser_workers"]}', file=sys.stderr)
+        print(f'[Nexus] host groups: max={CONFIG["max_active_hosts"]}  workers/host={CONFIG["workers_per_host"]}  global_cap={CONFIG["max_concurrency"]}', file=sys.stderr)
+        print(f'[Nexus] sessions:    {CONFIG["session_pool_size"]}  impersonate={len(keys)}', file=sys.stderr)
+        print(f'[Nexus] pdf:         {pdf_mode}   ocr: {"on" if ocr_ready else "off"}', file=sys.stderr)
+        print(f'[Nexus] max links:   {CONFIG["max_links_per_page"]}/page', file=sys.stderr)
 
         print('[Nexus] seeding sitemaps...', file=sys.stderr)
         try:
@@ -1254,18 +1497,24 @@ class Crawler:
         print('[Nexus] CTRL+C to stop.\n', file=sys.stderr)
 
         self.stats_task = asyncio.create_task(self._stats_loop())
-        workers = [asyncio.create_task(self._worker(i)) for i in range(CONFIG['initial_concurrency'])]
+        self.dispatcher_task = asyncio.create_task(self._dispatcher())
         try:
-            await asyncio.gather(*workers)
+            await self.dispatcher_task
         except asyncio.CancelledError:
             pass
         finally:
             self.stop_flag = True
             self.stats_task.cancel()
-            try:
-                await self.stats_task
-            except Exception:
-                pass
+            self.dispatcher_task.cancel()
+            for w in self.stats_task, self.dispatcher_task:
+                try:
+                    await w
+                except Exception:
+                    pass
+            # Cancel remaining host workers
+            for workers in list(self.host_workers.values()):
+                for w in workers:
+                    w.cancel()
             try:
                 if self.out_fd >= 0:
                     os.fsync(self.out_fd)
@@ -1295,10 +1544,11 @@ class Crawler:
             rate = dw / dt if dt > 0 else 0.0
             avg = self.written / (t - self.start_time) if t > self.start_time else 0.0
             err_pct = (self.dropped / self.fetched * 100.0) if self.fetched else 0.0
+            total_q = sum(len(q) for q in self.host_queues.values())
             print(
                 f'[s] {rate:6.1f}/s avg {avg:6.1f}/s  '
                 f'w={self.written} f={self.fetched} d={self.dropped}({err_pct:.0f}%)  '
-                f'q={len(self.queue)} h={len(self.host_gates)}  '
+                f'q={total_q} hosts={self.active_hosts}/{len(self.host_queues)}  '
                 f'g={self.gate.current} zl={self.zero_link_pages}  '
                 f'ch={self.challenges_total} im={self.impersonate_errors} bl={len(self.blacklisted_hosts)}',
                 file=sys.stderr,
@@ -1314,6 +1564,7 @@ class Crawler:
             f'dropped={self.dropped}  errors={self.errors}  '
             f'zerolink={self.zero_link_pages}  challenges={self.challenges_total}  '
             f'imp-errors={self.impersonate_errors}  '
+            f'hosts_seen={len(self.host_queues)}  '
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
@@ -1323,30 +1574,7 @@ class Crawler:
             top = sorted(self.drop_reasons.items(), key=lambda x: -x[1])[:10]
             print('[drops] ' + '  '.join(f'{r}={c}' for r, c in top), file=sys.stderr)
 
-    async def _worker(self, wid):
-        while not self.stop_flag:
-            try:
-                url, referer, depth = self.queue.popleft()
-            except IndexError:
-                self.queue_event.clear()
-                try:
-                    await asyncio.wait_for(self.queue_event.wait(), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pass
-                continue
-            host = host_of(url)
-            if not host:
-                continue
-            if host in self.blacklisted_hosts or self.rate_limiter.is_blacklisted(host):
-                self.blacklisted_hosts.add(host)
-                self.dropped += 1
-                continue
-            try:
-                await self._process(url, referer, depth, host)
-            except Exception as e:
-                self.errors += 1
-                if self.errors <= 20:
-                    print(f'[w{wid}] {url[:80]}: {type(e).__name__}: {e}', file=sys.stderr)
+    # ---------------------------------------------------------------- process
 
     async def _process(self, url, referer, depth, host):
         self.fetched += 1
@@ -1354,9 +1582,6 @@ class Crawler:
         retry_after = 0.0
         await self.rate_limiter.wait(host)
         await self.gate.acquire()
-        host_gate = self._host_gate(host)
-        host_gate.limit = self.rate_limiter.limit_for(host)
-        await host_gate.acquire()
         try:
             resp = None
             body_bytes = b''
@@ -1501,16 +1726,8 @@ class Crawler:
             if not links:
                 self.zero_link_pages += 1
             else:
-                misses = []
-                bl = self.bloom
-                for link in links:
-                    if link not in bl:
-                        bl.add(link)
-                        misses.append(link)
-                if misses and len(self.queue) < CONFIG['queue_high_water']:
-                    self._enqueue((link, url, depth + 1) for link in misses)
+                self._enqueue_many(links, url, depth + 1)
         finally:
-            await host_gate.release()
             await self.gate.release(status or 599)
             await self.rate_limiter.record(host, status, retry_after)
 
