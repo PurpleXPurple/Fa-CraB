@@ -16,16 +16,16 @@ from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 CONFIG = {
     'initial_concurrency': 200,
     'min_concurrency': 64,
-    'max_concurrency': 1200,
+    'max_concurrency': 1500,
     'session_pool_size': 32,
-    'rotate_min': 150,
-    'rotate_max': 350,
+    'rotate_min': 200,
+    'rotate_max': 400,
     'request_timeout': 12,
-    'max_html_bytes': 1_200_000,
-    'max_binary_bytes': 8_000_000,
+    'max_html_bytes': 1_500_000,
+    'max_binary_bytes': 10_000_000,
     'max_text_chars': 200_000,
     'max_redirects': 5,
-    'queue_high_water': 200_000,
+    'queue_high_water': 500_000,
     'stats_interval': 2.0,
     'idle_sleep': 0.001,
     'idle_deep_sleep': 1.0,
@@ -39,29 +39,26 @@ CONFIG = {
     'ocr_min_text_chars': 100,
     'ocr_max_chars': 400_000,
     'ocr_pdf_max_pages': 10,
-    'code_max_blocks': 32,
-    'code_min_chars': 40,
-    'code_min_unique_chars': 8,
     'batch_pop': 8,
     'batch_pop_small': 4,
     'per_host_base': 8,
     'per_host_max': 32,
     'per_host_min': 2,
-    'flaresolverr_endpoint': 'http://localhost:8191/v1',
-    'flaresolverr_timeout': 70,
-    'flaresolverr_concurrency': 3,
     'sitemap_max_count': 50,
     'sitemap_max_pages': 2000,
-    'seed_max_reinjections': 3,
-    'drop_log_limit': 30,
     'host_403_blacklist_threshold': 5,
     'impersonate_retry_limit': 2,
+    'drop_log_limit': 30,
 }
 
 OUTPUT_FILE = Path(CONFIG['output_file'])
 PARSER_POOL = ThreadPoolExecutor(max_workers=CONFIG['parser_workers'])
 OCR_POOL = ThreadPoolExecutor(max_workers=CONFIG['ocr_workers'])
 
+
+# ===========================================================================
+# Lazy loaders — nothing heavy is imported until it's actually needed
+# ===========================================================================
 
 _curl_AsyncSession = None
 _parser_cls = None
@@ -70,8 +67,6 @@ _pdf_reader_cls = None
 _pdf2image_conv = None
 _pytesseract = None
 _pil_image = None
-_cv2 = None
-_np = None
 
 
 def _load_session_cls():
@@ -127,7 +122,7 @@ def _load_pdf_render():
 
 
 def _load_ocr():
-    global _pytesseract, _pil_image, _cv2, _np
+    global _pytesseract, _pil_image
     if _pytesseract is None:
         try:
             import pytesseract as _pyt
@@ -137,49 +132,12 @@ def _load_ocr():
         except ImportError:
             _pytesseract = False
             _pil_image = False
-    if _cv2 is None:
-        try:
-            import cv2 as _cv
-            import numpy as _n
-            _cv2 = _cv
-            _np = _n
-        except ImportError:
-            _cv2 = False
-            _np = False
     return _pytesseract
 
 
-def _valid_impersonate_keys():
-    try:
-        from curl_cffi.const import BrowserType
-        keys = set()
-        for b in BrowserType:
-            v = b.value
-            if isinstance(v, str):
-                keys.add(v)
-        if keys:
-            return keys
-    except Exception:
-        pass
-    return None
-
-
-def _probe_impersonations():
-    valid = _valid_impersonate_keys()
-    working = set()
-    for b in _UA_BUNDLES:
-        key = b['key']
-        if key in working or key in _BAD_IMPERSONATIONS:
-            continue
-        if valid is None:
-            working.add(key)
-            continue
-        if key in valid:
-            working.add(key)
-        else:
-            _BAD_IMPERSONATIONS.add(key)
-    return working
-
+# ===========================================================================
+# Bloom filter — fixed-size, power-of-two bits, double-hash
+# ===========================================================================
 
 class BloomFilter:
     __slots__ = ('bits', 'num_bits', 'num_hashes', 'mask')
@@ -202,13 +160,7 @@ class BloomFilter:
         return h1, h2
 
     def add(self, item):
-        h1, h2 = self._h(item.encode('utf-8', 'ignore'))
-        bits = self.bits
-        mask = self.mask
-        n = self.num_hashes
-        for i in range(n):
-            idx = (h1 + i * h2) & mask
-            bits[idx >> 3] |= 1 << (idx & 7)
+        self.add_bytes(item.encode('utf-8', 'ignore'))
 
     def add_bytes(self, item_bytes):
         h1, h2 = self._h(item_bytes)
@@ -231,9 +183,14 @@ class BloomFilter:
         return True
 
 
+# ===========================================================================
+# Per-host rate limiting
+# ===========================================================================
+
 class DomainState:
     __slots__ = ('delay', 'fails', 'last_hit', 'limit', 'success_run',
                  'consecutive_403', 'blacklisted')
+
     def __init__(self, base_limit):
         self.delay = 0.0
         self.fails = 0
@@ -256,9 +213,7 @@ class RateLimitTracker:
 
     def limit_for(self, host):
         state = self.domains.get(host)
-        if state is None:
-            return self.base_limit
-        return state.limit
+        return state.limit if state is not None else self.base_limit
 
     def is_blacklisted(self, host):
         state = self.domains.get(host)
@@ -274,6 +229,7 @@ class RateLimitTracker:
 
     async def record(self, host, status, retry_after=0.0):
         state = self.domains.get(host)
+        # Fast path: clean 200, no delay yet.
         if status == 200 and retry_after == 0.0 and (state is None or state.delay <= 0.0):
             if state is None:
                 async with self._lock:
@@ -318,8 +274,13 @@ class RateLimitTracker:
                 state.delay = max(0.0, state.delay * 0.7 - 0.1)
 
 
+# ===========================================================================
+# Adaptive global concurrency gate
+# ===========================================================================
+
 class AdaptiveGate:
-    __slots__ = ('limit', 'min_lim', 'max_lim', 'inflight', '_cond', '_results', '_failures', '_releases')
+    __slots__ = ('limit', 'min_lim', 'max_lim', 'inflight',
+                 '_cond', '_results', '_failures', '_releases')
 
     def __init__(self, initial, min_lim, max_lim):
         self.limit = initial
@@ -368,202 +329,100 @@ class AdaptiveGate:
         return self.limit
 
 
-_IP_POOL = [
-    f'{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}'
-    for _ in range(2048)
-]
+# ===========================================================================
+# Header spoofing — the impersonation layer handles UA + Sec-CH-UA
+# ===========================================================================
 
 _ACCEPT_LANGS = (
     'en-US,en;q=0.9',
     'en-US,en;q=0.9,fr;q=0.8',
-    'en-US,en;q=0.9,es;q=0.7',
     'en-GB,en;q=0.9,en-US;q=0.8',
-    'en-CA,en;q=0.9,fr-CA;q=0.8',
     'en-US,en;q=0.8,de;q=0.6',
-    'en-US,en;q=0.8,nl;q=0.6',
 )
 
 _ACCEPTS = (
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
     'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
 )
 
 _REFERERS = (
     'https://www.google.com/',
-    'https://www.google.co.uk/',
-    'https://www.google.de/',
-    'https://www.google.fr/',
     'https://duckduckgo.com/',
     'https://www.bing.com/',
     'https://search.brave.com/',
     'https://www.startpage.com/',
-    'https://www.ecosia.org/',
-    'https://www.qwant.com/',
-    'https://yandex.com/',
 )
 
-_CACHE_CTRL = ('no-cache', 'max-age=0', 'no-store')
-_DNT = ('1', '1', '0')
-_VIA = ('1.1 google', '1.1 cloudflare', '1.1 akamai')
+
+def build_headers(referer, target_host):
+    o = random.choice
+    if referer:
+        ref_host = host_of(referer)
+        sec_site = 'same-origin' if ref_host == target_host else 'cross-site'
+    else:
+        sec_site = 'none'
+    return {
+        'Accept': o(_ACCEPTS),
+        'Accept-Language': o(_ACCEPT_LANGS),
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'DNT': '1',
+        'Upgrade-Insecure-Requests': '1',
+        'Connection': 'keep-alive',
+        'Referer': referer or o(_REFERERS),
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': sec_site,
+        'Sec-Fetch-User': '?1',
+    }
 
 
-def _make_ua_bundles():
-    bundles = []
-    for v, key in (
-        ('136', 'chrome136'),
-        ('131', 'chrome131'),
-        ('124', 'chrome124'),
-        ('120', 'chrome120'),
-        ('116', 'chrome116'),
-        ('110', 'chrome110'),
-    ):
-        for plat, sec_plat, sec_ver in (
-            ('Windows NT 10.0; Win64; x64', '"Windows"', '"10.0.0"'),
-            ('Windows NT 11.0; Win64; x64', '"Windows"', '"11.0.0"'),
-            ('Macintosh; Intel Mac OS X 14_7', '"macOS"', '"14.7.0"'),
-            ('X11; Linux x86_64', '"Linux"', '"6.5.0"'),
-        ):
-            bundles.append({
-                'ua': f'Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36',
-                'key': key,
-                'sec_plat': sec_plat,
-                'sec_plat_ver': sec_ver,
-                'full_ver': f'"{v}.0.0.0"',
-                'major_ver': v,
-                'chromium': True,
-            })
-    for ver in ('17.6', '17.0', '16.5'):
-        for plat in (
-            'Macintosh; Intel Mac OS X 14_7',
-            'Macintosh; Intel Mac OS X 13_6',
-            'Macintosh; Intel Mac OS X 12_7',
-        ):
-            bundles.append({
-                'ua': f'Mozilla/5.0 ({plat}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Safari/605.1.15',
-                'key': 'safari170',
-                'sec_plat': '"macOS"',
-                'sec_plat_ver': '"14.7.0"',
-                'full_ver': None,
-                'major_ver': ver.split('.')[0],
-                'chromium': False,
-            })
-    for ver in ('133', '128', '120'):
-        for plat, sec_plat in (
-            ('Windows NT 10.0; Win64; x64', '"Windows"'),
-            ('Macintosh; Intel Mac OS X 14.7', '"macOS"'),
-            ('X11; Linux x86_64', '"Linux"'),
-        ):
-            bundles.append({
-                'ua': f'Mozilla/5.0 ({plat}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0',
-                'key': 'firefox133' if ver == '133' else ('firefox128' if ver == '128' else 'firefox120'),
-                'sec_plat': sec_plat,
-                'sec_plat_ver': '"10.0.0"',
-                'full_ver': None,
-                'major_ver': ver,
-                'chromium': False,
-            })
-    return bundles
+# ===========================================================================
+# Session pool with rotation
+# ===========================================================================
 
-
-_UA_BUNDLES = _make_ua_bundles()
-_BAD_IMPERSONATIONS = set()
-
-
-class SpoofEngine:
-    __slots__ = ()
-
-    def build(self, bundle, referer, target_host):
-        o = random.choice
-        ip = _IP_POOL
-        if referer:
-            ref_host = host_of(referer)
-            sec_site = 'same-origin' if ref_host == target_host else 'cross-site'
-        else:
-            sec_site = 'none'
-        h = {
-            'User-Agent': bundle['ua'],
-            'Accept': o(_ACCEPTS),
-            'Accept-Language': o(_ACCEPT_LANGS),
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Charset': 'utf-8, iso-8859-1;q=0.5, *;q=0.1',
-            'Cache-Control': o(_CACHE_CTRL),
-            'Pragma': 'no-cache',
-            'DNT': o(_DNT),
-            'Upgrade-Insecure-Requests': '1',
-            'Connection': 'keep-alive',
-            'Priority': 'u=0, i',
-            'Referer': referer or o(_REFERERS),
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': sec_site,
-            'Sec-Fetch-User': '?1',
-            'X-Forwarded-For': f'{o(ip)},{o(ip)}',
-            'X-Real-IP': o(ip),
-            'Forwarded': f'for={o(ip)};proto=https',
-            'CF-Connecting-IP': o(ip),
-            'True-Client-IP': o(ip),
-            'X-Client-IP': o(ip),
-            'X-Originating-IP': f'[{o(ip)}]',
-            'X-Remote-IP': o(ip),
-            'X-Remote-Addr': o(ip),
-            'X-ProxyUser-Ip': o(ip),
-            'Via': o(_VIA),
-        }
-        if bundle['chromium']:
-            v = bundle['major_ver']
-            h['Sec-CH-UA'] = f'"Chromium";v="{v}", "Google Chrome";v="{v}", "Not-A.Brand";v="99"'
-            h['Sec-CH-UA-Mobile'] = '?0'
-            h['Sec-CH-UA-Platform'] = bundle['sec_plat']
-            h['Sec-CH-UA-Platform-Version'] = bundle['sec_plat_ver']
-            h['Sec-CH-UA-Arch'] = '"x86"'
-            h['Sec-CH-UA-Bitness'] = '"64"'
-            h['Sec-CH-UA-Full-Version'] = bundle['full_ver']
-            h['Sec-CH-UA-Model'] = '""'
-            h['Sec-CH-UA-WoW64'] = '?0'
-        return h
+def _available_impersonations():
+    try:
+        from curl_cffi.const import BrowserType
+        keys = sorted({b.value for b in BrowserType if isinstance(b.value, str)})
+        if keys:
+            return keys
+    except Exception:
+        pass
+    return [
+        'chrome136', 'chrome131', 'chrome124', 'chrome120', 'chrome116',
+        'chrome110', 'chrome107', 'chrome104', 'chrome101', 'chrome100',
+        'chrome99', 'edge101', 'edge99', 'safari170', 'safari155',
+        'safari153', 'firefox133', 'firefox128', 'firefox120',
+    ]
 
 
 class SessionPool:
-    __slots__ = ('size', 'sessions', 'bundles', 'hits', 'thresholds', 'locks')
+    __slots__ = ('size', 'keys', 'sessions', 'hits', 'thresholds', 'locks')
 
-    def __init__(self, size):
+    def __init__(self, size, keys):
         self.size = size
+        self.keys = keys
         self.sessions = [None] * size
-        self.bundles = [None] * size
         self.hits = [0] * size
         self.thresholds = [0] * size
         self.locks = [asyncio.Lock() for _ in range(size)]
 
     async def start(self):
+        SessionCls = _load_session_cls()
         for i in range(self.size):
-            b = self._pick_bundle()
-            self.bundles[i] = b
-            self.sessions[i] = self._make(b['key'])
+            self.sessions[i] = self._make(SessionCls)
             self.thresholds[i] = random.randint(CONFIG['rotate_min'], CONFIG['rotate_max'])
 
-    @staticmethod
-    def _pick_bundle():
-        valid = [b for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
-        if not valid:
-            valid = _UA_BUNDLES
-        return random.choice(valid)
-
-    @staticmethod
-    def _make(key):
-        SessionCls = _load_session_cls()
-        try:
-            return SessionCls(impersonate=key, timeout=CONFIG['request_timeout'])
-        except Exception:
-            _BAD_IMPERSONATIONS.add(key)
-            fallback = [b for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
-            if not fallback:
-                return None
+    def _make(self, SessionCls):
+        for _ in range(3):
+            key = random.choice(self.keys)
             try:
-                return SessionCls(impersonate=fallback[0]['key'], timeout=CONFIG['request_timeout'])
+                return SessionCls(impersonate=key, timeout=CONFIG['request_timeout'])
             except Exception:
-                return None
+                continue
+        return None
 
     async def stop(self):
         await asyncio.gather(
@@ -577,23 +436,13 @@ class SessionPool:
     def get(self, idx):
         return self.sessions[idx]
 
-    def bundle_of(self, idx):
-        return self.bundles[idx]
-
     def bump(self, idx):
         self.hits[idx] += 1
-        return self.hits[idx]
 
     def needs_rotation(self, idx):
         return self.hits[idx] >= self.thresholds[idx]
 
     def force_rotate(self, idx):
-        self.hits[idx] = self.thresholds[idx]
-
-    def blacklist_current(self, idx):
-        b = self.bundles[idx]
-        if b is not None:
-            _BAD_IMPERSONATIONS.add(b['key'])
         self.hits[idx] = self.thresholds[idx]
 
     async def rotate(self, idx):
@@ -606,12 +455,15 @@ class SessionPool:
                     await old.close()
                 except Exception:
                     pass
-            b = self._pick_bundle()
-            self.bundles[idx] = b
-            self.sessions[idx] = self._make(b['key'])
+            SessionCls = _load_session_cls()
+            self.sessions[idx] = self._make(SessionCls)
             self.hits[idx] = 0
             self.thresholds[idx] = random.randint(CONFIG['rotate_min'], CONFIG['rotate_max'])
 
+
+# ===========================================================================
+# URL normalization
+# ===========================================================================
 
 _BAD_SCHEMES = (
     'mailto:', 'tel:', 'sms:', 'callto:', 'skype:', 'whatsapp:',
@@ -641,11 +493,6 @@ _HARD_SKIP_PATH_RE = re.compile(
     r'cart|checkout|basket|order|payment|'
     r'admin|dashboard|account|settings|'
     r'cdn-cgi|wp-content/uploads|assets?|static)(/|$|\?)',
-    re.IGNORECASE,
-)
-
-_SOFT_SKIP_PATH_RE = re.compile(
-    r'^/(search|tag|category|author|page)/?(\?|$)',
     re.IGNORECASE,
 )
 
@@ -717,12 +564,6 @@ def normalize(url, base=''):
         return None
     if _HARD_SKIP_PATH_RE.search(path):
         return None
-    if _SOFT_SKIP_PATH_RE.search(path):
-        if not p.query:
-            return None
-        slug = path.rstrip('/').rsplit('/', 1)[-1]
-        if not slug or slug in ('search', 'tag', 'category', 'author', 'page'):
-            return None
     return _strip_tracking(url)
 
 
@@ -737,8 +578,12 @@ def host_of(url):
     return url[i:j].lower()
 
 
+# ===========================================================================
+# HTML parsing — content extraction + link harvesting
+# ===========================================================================
+
 _KILL_TAGS = (
-    'script', 'style', 'code', 'pre', 'noscript', 'svg', 'canvas',
+    'script', 'style', 'noscript', 'svg', 'canvas',
     'iframe', 'template', 'object', 'embed', 'applet', 'form',
     'input', 'button', 'select', 'textarea', 'option', 'map', 'area',
     'audio', 'video', 'source', 'track', 'dialog', 'menu', 'menuitem',
@@ -768,7 +613,6 @@ _MAIN_XPATHS = (
 _WS_RE = re.compile(r'[^\S\n]+')
 _NL_RE = re.compile(r'\n{3,}')
 _JUNK_RE = re.compile(r'[^\x20-\x7E\n\t]')
-
 _META_REFRESH_RE = re.compile(r'url\s*=\s*[\'"]?([^\'";]+)', re.IGNORECASE)
 
 _LINK_SELECTOR = (
@@ -777,379 +621,6 @@ _LINK_SELECTOR = (
     'link[rel="alternate"], link[rel="amphtml"], '
     'link[rel="sitemap"], meta[http-equiv="refresh"]'
 )
-
-_CODE_SELECTORS_STR = 'pre, .highlight, .codehilite, .chroma, .hljs'
-
-_PY_KW = re.compile(r'\b(def|class|import|from|return|self|elif|except|lambda|yield|async\s+def|await|print|None|True|False)\b')
-_JS_KW = re.compile(r'\b(function|const|let|var|=>|async|await|require|module\.exports|export\s+default|export\s+const|console\.log|new\s+Promise)\b')
-_HTML_KW = re.compile(r'</?[a-zA-Z][a-zA-Z0-9]*(\s[^<>]*)?/?>')
-_TAG_STRIP_RE = re.compile(r'<[^>]+>')
-_ENTITY_MAP = (
-    ('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'),
-    ('&quot;', '"'), ('&#39;', "'"), ('&apos;', "'"),
-    ('&nbsp;', ' '), ('&#160;', ' '),
-)
-
-_CODE_LANG_CLASS_RE = re.compile(r'(?:language|lang|highlight-source|brush)[-:]([a-zA-Z0-9+#]+)', re.IGNORECASE)
-_LANG_ALIASES = {
-    'py': 'python', 'python3': 'python', 'python2': 'python',
-    'js': 'javascript', 'mjs': 'javascript', 'cjs': 'javascript',
-    'node': 'javascript', 'ts': 'typescript', 'tsx': 'typescript',
-    'jsx': 'javascript', 'htm': 'html', 'xhtml': 'html',
-    'sh': 'shell', 'bash': 'shell', 'zsh': 'shell',
-    'yml': 'yaml', 'c++': 'cpp', 'c#': 'csharp',
-}
-
-_RSC_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)')
-_RSC_HREF_RE = re.compile(r'"(?:href|url)":"(https?://[^"]{1,500}|/[^"]{1,500})"')
-_RSC_ROUTE_RE = re.compile(r'"(/[a-zA-Z0-9_\-./%]{1,200})"')
-
-_JSONLD_RE = re.compile(
-    rb'<script[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-    re.IGNORECASE | re.DOTALL,
-)
-
-_CHALLENGE_TITLE_RE = re.compile(
-    r'^\s*(just a moment|attention required|checking your browser|'
-    r'verifying you are human|ddos protection|one more step|'
-    r'enable javascript and cookies)',
-    re.IGNORECASE,
-)
-
-_CHALLENGE_STRONG_MARKERS = (
-    b'<div id="cf-chl-widget',
-    b'<form id="challenge-form"',
-    b'__cf_chl_rt_tk',
-    b'cf-please-wait',
-    b'<span id="challenge-error-text">',
-    b'<title>just a moment',
-    b'<title>attention required',
-    b'<title>checking your browser',
-    b'<title>one more step',
-)
-
-_CHALLENGE_STATUS = (403, 503, 429)
-
-
-def _is_challenge_response(raw_text, raw_bytes, status, headers):
-    try:
-        mitigated = headers.get('cf-mitigated') or headers.get('CF-Mitigated')
-        if mitigated and 'challenge' in mitigated.lower():
-            return True
-    except Exception:
-        pass
-
-    if raw_text:
-        m = re.search(r'<title[^>]*>([^<]{1,200})</title>', raw_text, re.IGNORECASE)
-        if m and _CHALLENGE_TITLE_RE.search(m.group(1).strip()):
-            return True
-
-    if raw_bytes:
-        blen = len(raw_bytes)
-        if blen < 60000:
-            head = raw_bytes[:40000].lower()
-            for marker in _CHALLENGE_STRONG_MARKERS:
-                if marker in head:
-                    return True
-
-    if status in _CHALLENGE_STATUS and raw_bytes and len(raw_bytes) < 25000:
-        try:
-            server = (headers.get('server') or headers.get('Server') or '').lower()
-            if 'cloudflare' in server:
-                return True
-        except Exception:
-            pass
-
-    return False
-
-
-def _js_unescape(s):
-    if '\\' not in s:
-        return s
-    out = []
-    i = 0
-    n = len(s)
-    while i < n:
-        c = s[i]
-        if c == '\\' and i + 1 < n:
-            nx = s[i + 1]
-            if nx == 'n':
-                out.append('\n'); i += 2
-            elif nx == 'r':
-                out.append('\r'); i += 2
-            elif nx == 't':
-                out.append('\t'); i += 2
-            elif nx == '"':
-                out.append('"'); i += 2
-            elif nx == '\\':
-                out.append('\\'); i += 2
-            elif nx == '/':
-                out.append('/'); i += 2
-            elif nx == 'b':
-                out.append('\b'); i += 2
-            elif nx == 'f':
-                out.append('\f'); i += 2
-            elif nx == 'u' and i + 5 < n:
-                try:
-                    out.append(chr(int(s[i + 2:i + 6], 16))); i += 6
-                except ValueError:
-                    out.append(nx); i += 2
-            else:
-                out.append(nx); i += 2
-        else:
-            out.append(c); i += 1
-    return ''.join(out)
-
-
-def _extract_rsc_routes(raw_html, base_url):
-    if '__next_f' not in raw_html:
-        return ()
-    chunks = []
-    for m in _RSC_PUSH_RE.finditer(raw_html):
-        chunks.append(_js_unescape(m.group(1)))
-        if len(chunks) > 500:
-            break
-    if not chunks:
-        return ()
-    payload = ''.join(chunks)
-    if len(payload) > 5_000_000:
-        payload = payload[:5_000_000]
-
-    out = []
-    seen = set()
-    for m in _RSC_HREF_RE.finditer(payload):
-        n = normalize(m.group(1), base_url)
-        if n and n not in seen:
-            seen.add(n)
-            out.append(n)
-            if len(out) >= 2000:
-                return tuple(out)
-    for m in _RSC_ROUTE_RE.finditer(payload):
-        path = m.group(1)
-        if '//' in path:
-            continue
-        if path.endswith(('.js', '.css', '.png', '.jpg', '.jpeg', '.svg', '.json', '.woff', '.woff2')):
-            continue
-        n = normalize(path, base_url)
-        if n and n not in seen:
-            seen.add(n)
-            out.append(n)
-            if len(out) >= 2000:
-                return tuple(out)
-    return tuple(out)
-
-
-def _walk_json_for_urls(obj, base_url, out, seen, depth=0):
-    if depth > 12 or len(out) >= 2000:
-        return
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, str):
-                if k in ('url', '@id', 'sameAs', 'href', 'canonicalUrl', 'link', 'permalink', 'path'):
-                    if v.startswith(('http://', 'https://', '/')):
-                        n = normalize(v, base_url)
-                        if n and n not in seen:
-                            seen.add(n)
-                            out.append(n)
-            elif isinstance(v, (dict, list)):
-                _walk_json_for_urls(v, base_url, out, seen, depth + 1)
-    elif isinstance(obj, list):
-        for item in obj[:500]:
-            _walk_json_for_urls(item, base_url, out, seen, depth + 1)
-
-
-def _extract_structured_links(raw_bytes, raw_text, base_url):
-    out = []
-    seen = set()
-
-    if b'application/ld+json' in raw_bytes[:300_000]:
-        for m in _JSONLD_RE.finditer(raw_bytes):
-            try:
-                data = json.loads(m.group(1))
-                _walk_json_for_urls(data, base_url, out, seen)
-            except Exception:
-                continue
-            if len(out) >= 2000:
-                return tuple(out)
-
-    if b'window.__NUXT__' in raw_bytes:
-        idx = raw_text.find('window.__NUXT__')
-        if idx > 0:
-            try:
-                end = raw_text.find('</script>', idx)
-                if end < 0:
-                    end = min(idx + 500_000, len(raw_text))
-                snippet = raw_text[idx:end]
-                eq = snippet.find('=')
-                if eq > 0:
-                    js = snippet[eq + 1:].strip().rstrip(';').strip()
-                    if js.startswith('{') or js.startswith('['):
-                        data = json.loads(js)
-                        _walk_json_for_urls(data, base_url, out, seen)
-            except Exception:
-                pass
-
-    for marker in ('__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__'):
-        if marker.encode() not in raw_bytes:
-            continue
-        idx = raw_text.find(marker)
-        if idx < 0:
-            continue
-        try:
-            eq = raw_text.find('=', idx)
-            if eq < 0 or eq - idx > 100:
-                continue
-            start = eq + 1
-            while start < len(raw_text) and raw_text[start] in ' \t\n':
-                start += 1
-            if start >= len(raw_text) or raw_text[start] not in '{[':
-                continue
-            depth = 0
-            i = start
-            in_str = False
-            esc = False
-            limit = min(start + 2_000_000, len(raw_text))
-            while i < limit:
-                c = raw_text[i]
-                if esc:
-                    esc = False
-                elif c == '\\':
-                    esc = True
-                elif c == '"':
-                    in_str = not in_str
-                elif not in_str:
-                    if c in '{[':
-                        depth += 1
-                    elif c in '}]':
-                        depth -= 1
-                        if depth == 0:
-                            break
-                i += 1
-            if depth == 0 and i < limit:
-                data = json.loads(raw_text[start:i + 1])
-                _walk_json_for_urls(data, base_url, out, seen)
-        except Exception:
-            continue
-        if len(out) >= 2000:
-            break
-
-    return tuple(out)
-
-
-def _normalize_lang(raw):
-    low = raw.lower().strip()
-    return _LANG_ALIASES.get(low, low)
-
-
-def _detect_lang(text, explicit_class=''):
-    if explicit_class:
-        m = _CODE_LANG_CLASS_RE.search(explicit_class)
-        if m:
-            return _normalize_lang(m.group(1))
-    py = len(_PY_KW.findall(text))
-    js = len(_JS_KW.findall(text))
-    html = len(_HTML_KW.findall(text))
-    best_lang, best_score = 'python', py
-    if js > best_score:
-        best_lang, best_score = 'javascript', js
-    if html > best_score:
-        best_lang, best_score = 'html', html
-    if best_score < 2:
-        return 'unknown'
-    if best_lang == 'html' and html < 4:
-        return 'unknown'
-    if best_lang == 'python' and py < 2:
-        return 'unknown'
-    if best_lang == 'javascript' and js < 2:
-        return 'unknown'
-    return best_lang
-
-
-def _clean_code_snippet(text):
-    text = _TAG_STRIP_RE.sub('', text)
-    for ent, rep in _ENTITY_MAP:
-        if ent in text:
-            text = text.replace(ent, rep)
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-    lines = [ln.rstrip() for ln in text.split('\n')]
-    out = []
-    blank_run = 0
-    for ln in lines:
-        if not ln:
-            blank_run += 1
-            if blank_run > 2:
-                continue
-            out.append('')
-        else:
-            blank_run = 0
-            out.append(ln)
-    while out and not out[0]:
-        out.pop(0)
-    while out and not out[-1]:
-        out.pop()
-    return '\n'.join(out)
-
-
-def _code_quality_pass(text, cfg):
-    if len(text) < cfg['code_min_chars']:
-        return False
-    if len(set(text)) < cfg['code_min_unique_chars']:
-        return False
-    if text.count('\n') < 1:
-        return False
-    return True
-
-
-def _extract_code_selectolax(tree, cfg):
-    blocks = []
-    seen_text = set()
-    for node in tree.css(_CODE_SELECTORS_STR):
-        try:
-            raw = node.text(strip=False, separator='')
-        except Exception:
-            continue
-        if not raw:
-            continue
-        snippet = _clean_code_snippet(raw)
-        if not _code_quality_pass(snippet, cfg):
-            continue
-        if snippet in seen_text:
-            continue
-        cls = node.attributes.get('class') or ''
-        lang = _detect_lang(snippet, cls)
-        if lang == 'unknown':
-            continue
-        seen_text.add(snippet)
-        blocks.append({'lang': lang, 'snippet': snippet})
-        if len(blocks) >= cfg['code_max_blocks']:
-            break
-    return tuple(blocks)
-
-
-def _extract_code_lxml(doc, cfg):
-    blocks = []
-    seen_text = set()
-    for node in doc.iter('pre'):
-        try:
-            raw = node.text_content()
-        except Exception:
-            continue
-        if not raw:
-            continue
-        snippet = _clean_code_snippet(raw)
-        if not _code_quality_pass(snippet, cfg):
-            continue
-        if snippet in seen_text:
-            continue
-        cls = node.get('class') or ''
-        lang = _detect_lang(snippet, cls)
-        if lang == 'unknown':
-            continue
-        seen_text.add(snippet)
-        blocks.append({'lang': lang, 'snippet': snippet})
-        if len(blocks) >= cfg['code_max_blocks']:
-            break
-    return tuple(blocks)
 
 
 def _finalize_text(text):
@@ -1234,11 +705,11 @@ def _extract_links_lxml(doc, base_url):
     return tuple(links)
 
 
-def _parse_selectolax(raw, raw_bytes, base_url, cfg):
+def _parse_selectolax(raw, base_url, cfg):
     try:
         tree = _parser_cls(raw)
     except Exception:
-        return None, (), ()
+        return None, ()
 
     title = ''
     t = tree.css_first('title')
@@ -1253,18 +724,7 @@ def _parse_selectolax(raw, raw_bytes, base_url, cfg):
         if og:
             title = (og.attributes.get('content') or '')[:200]
 
-    links = list(_extract_links_selectolax(tree, base_url))
-    seen = set(links)
-    for extra in _extract_rsc_routes(raw, base_url):
-        if extra not in seen:
-            seen.add(extra)
-            links.append(extra)
-    for extra in _extract_structured_links(raw_bytes, raw, base_url):
-        if extra not in seen:
-            seen.add(extra)
-            links.append(extra)
-
-    code_blocks = _extract_code_selectolax(tree, cfg)
+    links = _extract_links_selectolax(tree, base_url)
 
     content = None
     for sel in _MAIN_SELECTORS:
@@ -1286,15 +746,15 @@ def _parse_selectolax(raw, raw_bytes, base_url, cfg):
     text = _finalize_text(text)
 
     if not text or len(text) < 50:
-        return None, tuple(links), code_blocks
-    return (title or '[untitled]', text), tuple(links), code_blocks
+        return None, links
+    return (title or '[untitled]', text), links
 
 
-def _parse_lxml(raw, raw_bytes, base_url, cfg):
+def _parse_lxml(raw, base_url, cfg):
     try:
         doc = _parser_cls.document_fromstring(raw, base_url=base_url)
     except Exception:
-        return None, (), ()
+        return None, ()
 
     title = ''
     t = doc.find('.//title')
@@ -1311,18 +771,7 @@ def _parse_lxml(raw, raw_bytes, base_url, cfg):
         if og:
             title = og[0][:200]
 
-    links = list(_extract_links_lxml(doc, base_url))
-    seen = set(links)
-    for extra in _extract_rsc_routes(raw, base_url):
-        if extra not in seen:
-            seen.add(extra)
-            links.append(extra)
-    for extra in _extract_structured_links(raw_bytes, raw, base_url):
-        if extra not in seen:
-            seen.add(extra)
-            links.append(extra)
-
-    code_blocks = _extract_code_lxml(doc, cfg)
+    links = _extract_links_lxml(doc, base_url)
 
     content = None
     for xp in _MAIN_XPATHS:
@@ -1346,17 +795,20 @@ def _parse_lxml(raw, raw_bytes, base_url, cfg):
     text = _finalize_text(text)
 
     if not text or len(text) < 50:
-        return None, tuple(links), code_blocks
-    return (title or '[untitled]', text), tuple(links), code_blocks
+        return None, links
+    return (title or '[untitled]', text), links
 
 
 def _parse_and_extract(raw, base_url):
-    raw_bytes = raw.encode('utf-8', 'ignore') if isinstance(raw, str) else raw
     cfg = CONFIG
     if _parser_mode == 'lexbor':
-        return _parse_selectolax(raw, raw_bytes, base_url, cfg)
-    return _parse_lxml(raw, raw_bytes, base_url, cfg)
+        return _parse_selectolax(raw, base_url, cfg)
+    return _parse_lxml(raw, base_url, cfg)
 
+
+# ===========================================================================
+# Binary extraction — PDF + images (optional OCR)
+# ===========================================================================
 
 def _pdf_extract_text(content_bytes):
     PdfReader = _load_pdf()
@@ -1384,16 +836,26 @@ def _pdf_extract_text(content_bytes):
                     parts.append(t)
             except Exception:
                 continue
-        text = '\n\n'.join(parts)
-        return title, text
+        return title, '\n\n'.join(parts)
+    except Exception:
+        return None
+
+
+def _image_ocr_pil(img):
+    if not _load_ocr():
+        return None
+    try:
+        if img.mode not in ('L', 'RGB'):
+            img = img.convert('RGB')
+        text = _pytesseract.image_to_string(img)
+        return text.strip() if text else None
     except Exception:
         return None
 
 
 def _pdf_ocr(content_bytes):
     conv = _load_pdf_render()
-    ocr = _load_ocr()
-    if not conv or not ocr:
+    if not conv or not _load_ocr():
         return None
     try:
         images = conv(content_bytes, dpi=200, fmt='png')
@@ -1408,35 +870,8 @@ def _pdf_ocr(content_bytes):
         return None
 
 
-def _image_ocr_pil(img):
-    ocr = _load_ocr()
-    if not ocr:
-        return None
-    try:
-        if img.mode not in ('L', 'RGB'):
-            img = img.convert('RGB')
-        if _cv2 and _np is not None:
-            try:
-                arr = _np.array(img.convert('L'))
-                h, w = arr.shape
-                if h < 200 or w < 200:
-                    scale = max(200 / h, 200 / w)
-                    arr = _cv2.resize(arr, (int(w * scale), int(h * scale)), interpolation=_cv2.INTER_CUBIC)
-                    h, w = arr.shape
-                if h * w < 4_000_000:
-                    _, arr = _cv2.threshold(arr, 0, 255, _cv2.THRESH_BINARY | _cv2.THRESH_OTSU)
-                img = _pil_image.fromarray(arr)
-            except Exception:
-                pass
-        text = _pytesseract.image_to_string(img)
-        return text.strip() if text else None
-    except Exception:
-        return None
-
-
 def _image_ocr_bytes(content_bytes):
-    ocr = _load_ocr()
-    if not ocr:
+    if not _load_ocr():
         return None
     try:
         from io import BytesIO
@@ -1450,8 +885,7 @@ def _extract_binary(content_bytes, content_type, url):
     if content_type == 'pdf':
         result = _pdf_extract_text(content_bytes)
         title, text = result if result else ('', '')
-        min_chars = CONFIG['ocr_min_text_chars']
-        if len(text) < min_chars and CONFIG['ocr_enabled']:
+        if len(text) < CONFIG['ocr_min_text_chars'] and CONFIG['ocr_enabled']:
             ocr_text = _pdf_ocr(content_bytes)
             if ocr_text and len(ocr_text) > len(text):
                 text = ocr_text
@@ -1475,11 +909,14 @@ def _extract_binary(content_bytes, content_type, url):
         if len(text) > CONFIG['ocr_max_chars']:
             text = text[:CONFIG['ocr_max_chars']]
         first_line = text.split('\n', 1)[0].strip()[:200]
-        title = first_line or '[image]'
-        return title, text
+        return first_line or '[image]', text
 
     return None
 
+
+# ===========================================================================
+# Bloom prefill from existing output (resume-safe)
+# ===========================================================================
 
 def _prefill_bloom_from_output(bloom):
     if not OUTPUT_FILE.exists():
@@ -1515,6 +952,39 @@ def _prefill_bloom_from_output(bloom):
         pass
 
 
+# ===========================================================================
+# Helpers: challenge detection, retry-after, sitemap parsing
+# ===========================================================================
+
+_CHALLENGE_MARKERS = (
+    b'<title>just a moment',
+    b'<title>attention required',
+    b'<title>checking your browser',
+    b'<title>one more step',
+    b'cf-chl-widget',
+    b'__cf_chl_rt_tk',
+    b'cf-please-wait',
+)
+
+
+def _is_challenge(raw_bytes, status, headers):
+    if status not in (403, 429, 503):
+        return False
+    try:
+        mitigated = headers.get('cf-mitigated') or headers.get('CF-Mitigated')
+        if mitigated and 'challenge' in mitigated.lower():
+            return True
+    except Exception:
+        pass
+    if not raw_bytes:
+        return False
+    head = raw_bytes[:40000].lower()
+    for m in _CHALLENGE_MARKERS:
+        if m in head:
+            return True
+    return False
+
+
 def _parse_retry_after(resp):
     try:
         ra = resp.headers.get('retry-after')
@@ -1537,18 +1007,18 @@ def _parse_retry_after(resp):
 _SITEMAP_LOC_RE = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.IGNORECASE)
 
 
+# ===========================================================================
+# Crawler
+# ===========================================================================
+
 class Crawler:
     __slots__ = (
-        'bloom', 'queue', 'host_inflight', 'pool', 'spoof', 'gate',
-        'rate_limiter', 'written', 'fetched', 'dropped', 'zero_link_pages',
-        'errors', 'stop_flag', 'out_fd', 'stats_task', 'start_time',
+        'bloom', 'queue', 'host_inflight', 'pool', 'gate', 'rate_limiter',
+        'written', 'fetched', 'dropped', 'zero_link_pages', 'errors',
+        'stop_flag', 'out_fd', 'stats_task', 'start_time',
         'last_report_time', 'last_report_written', 'seed', 'seed_host',
-        'seed_reinjections', 'seed_last_reinject', 'ocr_sem',
-        'code_blocks_total', 'ocr_pages_total', 'challenges_total',
-        'flaresolverr_session', 'flaresolverr_available', 'fs_checked',
-        'flare_sem', 'challenged_hosts', 'resolved_hosts',
+        'ocr_sem', 'challenges_total', 'blacklisted_hosts',
         'drop_log_count', 'drop_reasons', 'impersonate_errors',
-        'blacklisted_hosts',
     )
 
     def __init__(self):
@@ -1556,7 +1026,6 @@ class Crawler:
         self.queue = deque()
         self.host_inflight = {}
         self.pool = None
-        self.spoof = SpoofEngine()
         self.gate = AdaptiveGate(
             CONFIG['initial_concurrency'],
             CONFIG['min_concurrency'],
@@ -1576,22 +1045,12 @@ class Crawler:
         self.last_report_written = 0
         self.seed = ''
         self.seed_host = ''
-        self.seed_reinjections = 0
-        self.seed_last_reinject = 0.0
         self.ocr_sem = None
-        self.code_blocks_total = 0
-        self.ocr_pages_total = 0
         self.challenges_total = 0
-        self.flaresolverr_session = None
-        self.flaresolverr_available = None
-        self.fs_checked = False
-        self.flare_sem = None
-        self.challenged_hosts = set()
-        self.resolved_hosts = set()
+        self.blacklisted_hosts = set()
         self.drop_log_count = 0
         self.drop_reasons = {}
         self.impersonate_errors = 0
-        self.blacklisted_hosts = set()
 
     def _log_drop(self, reason, url):
         self.dropped += 1
@@ -1600,111 +1059,35 @@ class Crawler:
             self.drop_log_count += 1
             print(f'[drop:{reason}] {url[:110]}', file=sys.stderr)
 
-    async def _probe_flare(self):
-        base = CONFIG['flaresolverr_endpoint'].rsplit('/v1', 1)[0]
-        health = f'{base}/health'
+    async def _standalone_fetch(self, url, timeout=15):
         SessionCls = _load_session_cls()
-        try:
-            async with SessionCls(timeout=3, impersonate='chrome136') as sess:
-                resp = await sess.get(health)
-                if resp.status_code == 200:
-                    self.flaresolverr_available = True
-                    print('[flare] available', file=sys.stderr)
-                    return
-        except Exception:
-            pass
-        self.flaresolverr_available = False
-        print('[flare] NOT running — Cloudflare-challenged sites will be dropped', file=sys.stderr)
-        print('[flare] to enable: docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest', file=sys.stderr)
-
-    async def _flaresolverr_fetch(self, url):
-        if self.flaresolverr_available is not True:
-            return None
-        try:
-            SessionCls = _load_session_cls()
-            if self.flaresolverr_session is None:
-                self.flaresolverr_session = SessionCls(timeout=CONFIG['flaresolverr_timeout'])
-            resp = await self.flaresolverr_session.post(
-                CONFIG['flaresolverr_endpoint'],
-                json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
-                timeout=CONFIG['flaresolverr_timeout'],
-            )
-            if resp.status_code != 200:
-                self.flaresolverr_available = False
-                print('[flare] endpoint returned non-200 — disabling flare for this run', file=sys.stderr)
-                return None
-            data = resp.json()
-            if data.get('status') != 'ok':
-                solution = data.get('solution') or {}
-                html = solution.get('response')
-                if isinstance(html, str) and html:
-                    return html
-                return None
-            solution = data.get('solution') or {}
-            html = solution.get('response')
-            return html if isinstance(html, str) and html else None
-        except Exception as e:
-            self.flaresolverr_available = False
-            print(f'[flare] {type(e).__name__}: {e} — disabling flare for this run', file=sys.stderr)
-            return None
-
-    async def _standalone_fetch(self, url, timeout=15, use_flare=True):
-        SessionCls = _load_session_cls()
-        valid = [b['key'] for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
-        key = random.choice(valid) if valid else 'chrome136'
-        raw = None
-        status = 0
-        headers = {}
-        body_bytes = b''
+        key = random.choice(self.pool.keys) if self.pool and self.pool.keys else 'chrome136'
         try:
             async with SessionCls(impersonate=key, timeout=timeout) as sess:
                 resp = await sess.get(url, allow_redirects=True, max_redirects=5)
-                status = resp.status_code
-                try:
-                    headers = dict(resp.headers)
-                except Exception:
-                    headers = {}
-                try:
-                    body_bytes = resp.content or b''
-                except Exception:
-                    body_bytes = b''
-                if status == 200:
+                if resp.status_code == 200:
                     try:
-                        raw = resp.text
+                        return resp.text
                     except Exception:
                         try:
-                            raw = body_bytes.decode('utf-8', 'ignore')
+                            return (resp.content or b'').decode('utf-8', 'ignore')
                         except Exception:
-                            raw = None
+                            return None
         except Exception:
-            raw = None
-
-        if use_flare and self.flaresolverr_available is True and status in (403, 503, 429):
-            if _is_challenge_response(raw or '', body_bytes, status, headers):
-                host = host_of(url)
-                if host:
-                    self.challenged_hosts.add(host)
-                solved = await self._flaresolverr_fetch(url)
-                if solved:
-                    return solved
-        return raw
+            return None
 
     async def _seed_sitemaps(self, seed_url):
         parsed = urlparse(seed_url)
         base = f'{parsed.scheme}://{parsed.netloc}'
         robots_url = f'{base}/robots.txt'
-        robots = None
-        try:
-            robots = await self._standalone_fetch(robots_url, timeout=15)
-        except Exception:
-            robots = None
+
+        robots = await self._standalone_fetch(robots_url, timeout=15)
 
         sitemap_urls = []
         if robots:
             for line in robots.splitlines():
                 line = line.strip()
-                low = line.lower()
-                if low.startswith('sitemap:'):
+                if line.lower().startswith('sitemap:'):
                     sm = line[8:].strip()
                     if sm.startswith(('http://', 'https://')):
                         sitemap_urls.append(sm)
@@ -1742,35 +1125,28 @@ class Crawler:
                         pages_added += 1
                         if pages_added >= max_pages:
                             break
-        print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages', file=sys.stderr)
+        print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages queued', file=sys.stderr)
 
     async def run(self, seed):
         self.seed = seed
         self.seed_host = host_of(seed)
+
         mode = _load_parser()
         if mode == 'none':
-            print('[!] no HTML parser available', file=sys.stderr)
+            print('[!] no HTML parser available (install selectolax or lxml)', file=sys.stderr)
             return
 
-        global _UA_BUNDLES
-        before = len({b['key'] for b in _UA_BUNDLES})
-        working = _probe_impersonations()
-        if working:
-            _UA_BUNDLES = [b for b in _UA_BUNDLES if b['key'] in working]
-        after = len({b['key'] for b in _UA_BUNDLES})
-        if after == 0:
-            print('[!] no valid impersonations in installed curl_cffi', file=sys.stderr)
+        keys = _available_impersonations()
+        if not keys:
+            print('[!] no valid curl_cffi impersonation keys', file=sys.stderr)
             return
-        if before != after:
-            print(f'[impersonate] dropped {before - after} invalid keys, using: {sorted(set(b["key"] for b in _UA_BUNDLES))}', file=sys.stderr)
 
         _prefill_bloom_from_output(self.bloom)
         self.bloom.add(seed)
         self.queue.append((seed, '', 0))
 
         self.ocr_sem = asyncio.Semaphore(CONFIG['ocr_concurrency'])
-        self.flare_sem = asyncio.Semaphore(CONFIG['flaresolverr_concurrency'])
-        self.pool = SessionPool(CONFIG['session_pool_size'])
+        self.pool = SessionPool(CONFIG['session_pool_size'], keys)
         await self.pool.start()
 
         self.out_fd = os.open(
@@ -1791,8 +1167,7 @@ class Crawler:
         print(f'[Nexus] per-host: {CONFIG["per_host_base"]} base, {CONFIG["per_host_min"]}-{CONFIG["per_host_max"]} adaptive', file=sys.stderr)
         print(f'[Nexus] pdf:      {"pypdf" if pdf_ready else "unavailable"}', file=sys.stderr)
         print(f'[Nexus] ocr:      {"enabled" if ocr_ready else "disabled"}  workers={CONFIG["ocr_workers"]}', file=sys.stderr)
-
-        await self._probe_flare()
+        print(f'[Nexus] impersonate: {len(keys)} keys', file=sys.stderr)
 
         print('[Nexus] seeding sitemaps...', file=sys.stderr)
         try:
@@ -1813,11 +1188,6 @@ class Crawler:
             self.stats_task.cancel()
             try:
                 await self.stats_task
-            except Exception:
-                pass
-            try:
-                if self.flaresolverr_session is not None:
-                    await self.flaresolverr_session.close()
             except Exception:
                 pass
             try:
@@ -1855,7 +1225,6 @@ class Crawler:
                 f'dropped={self.dropped}  errors={self.errors}  '
                 f'queue={len(self.queue)}  hosts={len(self.host_inflight)}  '
                 f'conc={self.gate.current}  zerolink={self.zero_link_pages}  '
-                f'code={self.code_blocks_total}  ocr={self.ocr_pages_total}  '
                 f'chal={self.challenges_total}  imp-err={self.impersonate_errors}  '
                 f'bl={len(self.blacklisted_hosts)}',
                 file=sys.stderr,
@@ -1870,7 +1239,6 @@ class Crawler:
             f'\n[Nexus] stopped. written={self.written}  fetched={self.fetched}  '
             f'dropped={self.dropped}  errors={self.errors}  '
             f'zerolink={self.zero_link_pages}  '
-            f'code_blocks={self.code_blocks_total}  ocr_pages={self.ocr_pages_total}  '
             f'challenges={self.challenges_total}  imp-errors={self.impersonate_errors}  '
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
@@ -1883,29 +1251,13 @@ class Crawler:
                 print(f'  {r}: {c}', file=sys.stderr)
 
     async def _worker(self, wid):
-        idle_rounds = 0
         while not self.stop_flag:
             qlen = len(self.queue)
             if qlen == 0:
-                idle_rounds += 1
-                if not self.host_inflight:
-                    now = time.monotonic()
-                    if (self.seed_reinjections < CONFIG['seed_max_reinjections']
-                            and self.seed
-                            and idle_rounds > 20
-                            and now - self.seed_last_reinject > 5.0):
-                        self.seed_reinjections += 1
-                        self.seed_last_reinject = now
-                        self.queue.append((self.seed, '', 0))
-                        idle_rounds = 0
-                        continue
-                    await asyncio.sleep(
-                        CONFIG['idle_deep_sleep'] if idle_rounds > 100 else CONFIG['idle_sleep']
-                    )
-                else:
-                    await asyncio.sleep(CONFIG['idle_sleep'])
+                await asyncio.sleep(
+                    CONFIG['idle_deep_sleep'] if not self.host_inflight else CONFIG['idle_sleep']
+                )
                 continue
-            idle_rounds = 0
 
             batch_size = CONFIG['batch_pop'] if qlen >= 64 else CONFIG['batch_pop_small']
             batch = []
@@ -1921,8 +1273,7 @@ class Crawler:
                 if not host:
                     continue
                 if host in self.blacklisted_hosts or self.rate_limiter.is_blacklisted(host):
-                    if host not in self.blacklisted_hosts:
-                        self.blacklisted_hosts.add(host)
+                    self.blacklisted_hosts.add(host)
                     self.dropped += 1
                     continue
                 inflight = self.host_inflight.get(host, 0)
@@ -1965,17 +1316,14 @@ class Crawler:
             raw = None
             resp_headers = {}
 
-            for attempt in range(CONFIG['impersonate_retry_limit'] + 1):
+            for _ in range(CONFIG['impersonate_retry_limit'] + 1):
                 idx = self.pool.pick()
                 sess = self.pool.get(idx)
                 if sess is None:
                     self.pool.force_rotate(idx)
                     await self.pool.rotate(idx)
                     continue
-                bundle = self.pool.bundle_of(idx)
-                if bundle is None:
-                    continue
-                headers = self.spoof.build(bundle, referer, host)
+                headers = build_headers(referer, host)
                 try:
                     resp = await sess.get(
                         url,
@@ -2005,7 +1353,7 @@ class Crawler:
                     self.pool.bump(idx)
                     if 'Impersonate' in err_name:
                         self.impersonate_errors += 1
-                        self.pool.blacklist_current(idx)
+                        self.pool.force_rotate(idx)
                         try:
                             await self.pool.rotate(idx)
                         except Exception:
@@ -2030,38 +1378,20 @@ class Crawler:
 
             ctype = (resp_headers.get('content-type') or resp_headers.get('Content-Type') or '').lower()
 
-            is_chal = _is_challenge_response(raw or '', body_bytes, status, resp_headers)
-
-            if is_chal:
+            if _is_challenge(body_bytes, status, resp_headers):
                 self.challenges_total += 1
-                self.challenged_hosts.add(host)
-                if self.flaresolverr_available is True:
-                    async with self.flare_sem:
-                        solved = await self._flaresolverr_fetch(url)
-                    if solved:
-                        self.resolved_hosts.add(host)
-                        raw = solved
-                        body_bytes = solved.encode('utf-8', 'ignore') if isinstance(solved, str) else body_bytes
-                        status = 200
-                        if not ctype:
-                            ctype = 'text/html'
-                    else:
-                        self._log_drop('challenge-unsolved', url)
-                        return
-                else:
-                    self._log_drop(f'challenge-no-flare-{status}', url)
-                    return
+                self._log_drop(f'challenge-{status}', url)
+                return
 
             if status != 200:
                 if status in (403, 429, 502, 503, 520, 521, 522, 523, 524):
                     self.pool.force_rotate(idx)
                     asyncio.create_task(self.pool.rotate(idx))
-                if status in (429, 503) and resp is not None:
+                if status in (429, 503):
                     retry_after = _parse_retry_after(resp)
                 self._log_drop(f'status-{status}', url)
                 return
 
-            content_type = None
             if 'text/html' in ctype or 'application/xhtml' in ctype or not ctype:
                 content_type = 'html'
             elif 'application/pdf' in ctype:
@@ -2080,20 +1410,14 @@ class Crawler:
                     return
                 if len(raw) > CONFIG['max_html_bytes']:
                     raw = raw[:CONFIG['max_html_bytes']]
-
                 try:
-                    cleaned, links, code = await loop.run_in_executor(
+                    cleaned, links = await loop.run_in_executor(
                         PARSER_POOL, _parse_and_extract, raw, url
                     )
                 except Exception as e:
                     self._log_drop(f'parse-{type(e).__name__}', url)
                     return
             else:
-                if not body_bytes:
-                    try:
-                        body_bytes = resp.content or b''
-                    except Exception:
-                        body_bytes = b''
                 if not body_bytes:
                     self._log_drop('empty-binary', url)
                     return
@@ -2109,18 +1433,12 @@ class Crawler:
                         self._log_drop(f'ocr-{type(e).__name__}', url)
                         return
                 links = ()
-                code = ()
-                if cleaned is not None:
-                    self.ocr_pages_total += 1
 
             if cleaned is not None:
                 title, text = cleaned
                 record = {'url': url, 'title': title, 'text': text}
                 if content_type != 'html':
                     record['content_type'] = content_type
-                if code:
-                    record['code'] = list(code)
-                    self.code_blocks_total += len(code)
                 line = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8') + b'\n'
                 try:
                     os.write(self.out_fd, line)
@@ -2148,6 +1466,10 @@ class Crawler:
             await self.gate.release(status or 599)
             await self.rate_limiter.record(host, status, retry_after)
 
+
+# ===========================================================================
+# Entrypoint
+# ===========================================================================
 
 async def main():
     try:
