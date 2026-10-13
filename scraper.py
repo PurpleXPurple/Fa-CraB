@@ -23,6 +23,7 @@ CONFIG = {
     'request_timeout': 12,
     'max_html_bytes': 1_200_000,
     'max_binary_bytes': 8_000_000,
+    'max_text_chars': 200_000,
     'max_redirects': 5,
     'queue_high_water': 500_000,
     'stats_interval': 2.0,
@@ -37,12 +38,18 @@ CONFIG = {
     'ocr_enabled': True,
     'ocr_min_text_chars': 100,
     'ocr_max_chars': 400_000,
+    'ocr_pdf_max_pages': 10,
     'code_max_blocks': 32,
     'code_min_chars': 40,
     'code_min_unique_chars': 8,
     'batch_pop': 8,
     'batch_pop_small': 4,
     'per_host_limit': 6,
+    'flaresolverr_endpoint': 'http://localhost:8191/v1',
+    'flaresolverr_timeout': 70,
+    'sitemap_max_count': 50,
+    'sitemap_max_pages': 2000,
+    'seed_max_reinjections': 3,
 }
 
 OUTPUT_FILE = Path(CONFIG['output_file'])
@@ -235,7 +242,7 @@ class RateLimitTracker:
 
 
 class AdaptiveGate:
-    __slots__ = ('limit', 'min_lim', 'max_lim', 'inflight', '_cond', '_results', '_releases')
+    __slots__ = ('limit', 'min_lim', 'max_lim', 'inflight', '_cond', '_results', '_failures', '_releases')
 
     def __init__(self, initial, min_lim, max_lim):
         self.limit = initial
@@ -243,7 +250,8 @@ class AdaptiveGate:
         self.max_lim = max_lim
         self.inflight = 0
         self._cond = asyncio.Condition()
-        self._results = deque(maxlen=128)
+        self._results = deque()
+        self._failures = 0
         self._releases = 0
 
     async def acquire(self):
@@ -255,7 +263,13 @@ class AdaptiveGate:
     async def release(self, status):
         async with self._cond:
             self.inflight -= 1
+            if len(self._results) >= 128:
+                old = self._results.popleft()
+                if old >= 400:
+                    self._failures -= 1
             self._results.append(status)
+            if status >= 400:
+                self._failures += 1
             self._releases += 1
             if self._releases >= 32:
                 self._releases = 0
@@ -266,8 +280,7 @@ class AdaptiveGate:
         n = len(self._results)
         if n < 96:
             return
-        fails = sum(1 for s in self._results if s >= 400)
-        rate = fails / n
+        rate = self._failures / n
         if rate > 0.20:
             self.limit = max(self.min_lim, int(self.limit * 0.75))
         elif rate < 0.04 and self.limit < self.max_lim:
@@ -314,16 +327,8 @@ _REFERERS = (
     'https://yandex.com/',
 )
 
-_SEC_CH_UA = (
-    '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
-    '"Chromium";v="136", "Not(A:Brand";v="24", "Google Chrome";v="136"',
-    '"Google Chrome";v="136", "Chromium";v="136", "Not=A?Brand";v="24"',
-    '"Google Chrome";v="136", "Not.A/Brand";v="8", "Chromium";v="136"',
-)
-
 _CACHE_CTRL = ('no-cache', 'max-age=0', 'no-store')
 _DNT = ('1', '1', '0')
-_SEC_FETCH_SITE = ('none', 'same-origin', 'cross-site')
 _VIA = ('1.1 google', '1.1 cloudflare', '1.1 akamai')
 
 
@@ -350,6 +355,7 @@ def _make_ua_bundles():
                 'sec_plat': sec_plat,
                 'sec_plat_ver': sec_ver,
                 'full_ver': f'"{v}.0.0.0"',
+                'major_ver': v,
                 'chromium': True,
             })
     for ver in ('18.4', '17.6', '18.2'):
@@ -364,6 +370,7 @@ def _make_ua_bundles():
                 'sec_plat': '"macOS"',
                 'sec_plat_ver': '"14.7.0"',
                 'full_ver': None,
+                'major_ver': ver.split('.')[0],
                 'chromium': False,
             })
     for ver, key in (('135', 'firefox135'), ('133', 'firefox133'), ('128', 'firefox128')):
@@ -378,6 +385,7 @@ def _make_ua_bundles():
                 'sec_plat': sec_plat,
                 'sec_plat_ver': '"10.0.0"',
                 'full_ver': None,
+                'major_ver': ver,
                 'chromium': False,
             })
     return bundles
@@ -389,9 +397,17 @@ _UA_BUNDLES = _make_ua_bundles()
 class SpoofEngine:
     __slots__ = ()
 
-    def build(self, bundle, referer):
+    def build(self, bundle, referer, target_host):
         o = random.choice
         ip = _IP_POOL
+        if referer:
+            ref_host = host_of(referer)
+            if ref_host == target_host:
+                sec_site = 'same-origin'
+            else:
+                sec_site = 'cross-site'
+        else:
+            sec_site = 'none'
         h = {
             'User-Agent': bundle['ua'],
             'Accept': o(_ACCEPTS),
@@ -407,7 +423,7 @@ class SpoofEngine:
             'Referer': referer or o(_REFERERS),
             'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': o(_SEC_FETCH_SITE),
+            'Sec-Fetch-Site': sec_site,
             'Sec-Fetch-User': '?1',
             'X-Forwarded-For': f'{o(ip)},{o(ip)}',
             'X-Real-IP': o(ip),
@@ -422,7 +438,8 @@ class SpoofEngine:
             'Via': o(_VIA),
         }
         if bundle['chromium']:
-            h['Sec-CH-UA'] = o(_SEC_CH_UA)
+            v = bundle['major_ver']
+            h['Sec-CH-UA'] = f'"Chromium";v="{v}", "Google Chrome";v="{v}", "Not-A.Brand";v="99"'
             h['Sec-CH-UA-Mobile'] = '?0'
             h['Sec-CH-UA-Platform'] = bundle['sec_plat']
             h['Sec-CH-UA-Platform-Version'] = bundle['sec_plat_ver']
@@ -467,7 +484,7 @@ class SessionPool:
         )
 
     def pick(self):
-        return random.getrandbits(6) % self.size
+        return random.randrange(self.size)
 
     def get(self, idx):
         return self.sessions[idx]
@@ -517,22 +534,25 @@ _SKIP_EXT = re.compile(
     r'woff2?|ttf|otf|eot|'
     r'mp[34]|m4a|m4v|aac|ogg|oga|ogv|wav|flac|opus|'
     r'avi|mkv|mov|webm|flv|wmv|mpg|mpeg|3gp|'
-    r'pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|'
+    r'docx?|xlsx?|pptx?|odt|ods|odp|rtf|'
     r'zip|tar|gz|tgz|bz2|xz|rar|7z|lz|lzma|zst|'
     r'exe|dmg|msi|apk|deb|rpm|iso|img|bin|jar|class|'
-    r'xml|rss|atom|json|jsonl|ndjson|csv|tsv|yaml|yml|toml|ini|conf|cfg|'
+    r'rss|atom|jsonl|ndjson|csv|tsv|yaml|yml|toml|ini|conf|cfg|'
     r'psd|ai|eps|sketch|fig|xd|'
     r'torrent|magnet|wasm)(\?|#|$)',
     re.IGNORECASE,
 )
 
-_SKIP_PATH_RE = re.compile(
+_HARD_SKIP_PATH_RE = re.compile(
     r'/(wp-admin|wp-login\.php|wp-json|xmlrpc\.php|'
-    r'login|logout|signin|sign-in|signup|sign-up|register|'
     r'cart|checkout|basket|order|payment|'
-    r'admin|dashboard|account|profile|settings|'
-    r'cdn-cgi|wp-content/uploads|assets?|static|media|'
-    r'search|tag/|category/|author/)(/|$|\?)',
+    r'admin|dashboard|account|settings|'
+    r'cdn-cgi|wp-content/uploads|assets?|static)(/|$|\?)',
+    re.IGNORECASE,
+)
+
+_SOFT_SKIP_PATH_RE = re.compile(
+    r'^/(search|tag|category|author|page)/?(\?|$)',
     re.IGNORECASE,
 )
 
@@ -599,10 +619,20 @@ def normalize(url, base=''):
     if not netloc or '.' not in netloc or len(netloc) > 253:
         return None
     path = p.path
-    if '.' in path and _SKIP_EXT.search(path):
+    if len(path) > 60:
+        path_check = path[:60] + path[-40:] if len(path) > 100 else path
+    else:
+        path_check = path
+    if '.' in path_check and _SKIP_EXT.search(path_check):
         return None
-    if len(path) > 5 and _SKIP_PATH_RE.search(path):
+    if _HARD_SKIP_PATH_RE.search(path):
         return None
+    if _SOFT_SKIP_PATH_RE.search(path):
+        if not p.query:
+            return None
+        slug = path.rstrip('/').rsplit('/', 1)[-1]
+        if not slug or slug in ('search', 'tag', 'category', 'author', 'page'):
+            return None
     return _strip_tracking(url)
 
 
@@ -628,23 +658,13 @@ _KILL_TAGS = (
 _KILL_SELECTOR = ','.join(_KILL_TAGS)
 
 _MAIN_SELECTORS = (
-    'article',
-    'main',
-    '[role="main"]',
-    '#content',
-    '.post-content',
-    '.entry-content',
-    '.article-content',
-    '.article-body',
-    '.story-body',
-    '.content-body',
+    'article', 'main', '[role="main"]', '#content',
+    '.post-content', '.entry-content', '.article-content',
+    '.article-body', '.story-body', '.content-body',
 )
 
 _MAIN_XPATHS = (
-    '//article',
-    '//main',
-    '//*[@role="main"]',
-    '//*[@id="content"]',
+    '//article', '//main', '//*[@role="main"]', '//*[@id="content"]',
     '//*[contains(@class, "post-content")]',
     '//*[contains(@class, "entry-content")]',
     '//*[contains(@class, "article-content")]',
@@ -659,8 +679,14 @@ _JUNK_RE = re.compile(r'[^\x20-\x7E\n\t]')
 
 _META_REFRESH_RE = re.compile(r'url\s*=\s*[\'"]?([^\'";]+)', re.IGNORECASE)
 
+_LINK_SELECTOR = (
+    'a[href], area[href], iframe[src], frame[src], '
+    'link[rel="next"], link[rel="prev"], link[rel="canonical"], '
+    'link[rel="alternate"], link[rel="amphtml"], '
+    'link[rel="sitemap"], meta[http-equiv="refresh"]'
+)
+
 _CODE_SELECTORS_STR = 'pre, .highlight, .codehilite, .chroma, .hljs'
-_CODE_SELECTORS_LIST = ('pre', '.highlight', '.codehilite', '.chroma', '.hljs')
 
 _PY_KW = re.compile(r'\b(def|class|import|from|return|self|elif|except|lambda|yield|async\s+def|await|print|None|True|False)\b')
 _JS_KW = re.compile(r'\b(function|const|let|var|=>|async|await|require|module\.exports|export\s+default|export\s+const|console\.log|new\s+Promise)\b')
@@ -681,6 +707,217 @@ _LANG_ALIASES = {
     'sh': 'shell', 'bash': 'shell', 'zsh': 'shell',
     'yml': 'yaml', 'c++': 'cpp', 'c#': 'csharp',
 }
+
+_RSC_PUSH_RE = re.compile(r'self\.__next_f\.push\(\[\d+,\s*"((?:[^"\\]|\\.)*)"\]\)')
+_RSC_HREF_RE = re.compile(r'"(?:href|url)":"(https?://[^"]{1,500}|/[^"]{1,500})"')
+_RSC_ROUTE_RE = re.compile(r'"(/[a-zA-Z0-9_\-./%]{1,200})"')
+
+_JSONLD_RE = re.compile(
+    rb'<script[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_CHALLENGE_TITLE_RE = re.compile(
+    r'just a moment|attention required|checking your browser|verifying you are human|ddos protection|cf-browser-verification',
+    re.IGNORECASE,
+)
+
+_CHALLENGE_BODY_MARKERS = (
+    b'cf-chl-', b'__cf_chl_', b'turnstile', b'challenge-platform',
+    b'cf_chl_opt', b'/cdn-cgi/challenge-platform', b'cf-please-wait',
+    b'<title>just a moment', b'<title>attention required',
+)
+
+
+def _is_challenge_response(raw_text, raw_bytes, status, headers):
+    try:
+        mitigated = headers.get('cf-mitigated') or headers.get('CF-Mitigated')
+        if mitigated and 'challenge' in mitigated.lower():
+            return True
+    except Exception:
+        pass
+    if raw_bytes:
+        head = raw_bytes[:30000].lower()
+        for marker in _CHALLENGE_BODY_MARKERS:
+            if marker in head:
+                return True
+    if raw_text:
+        m = re.search(r'<title[^>]*>([^<]{1,200})</title>', raw_text, re.IGNORECASE)
+        if m and _CHALLENGE_TITLE_RE.search(m.group(1)):
+            return True
+    return False
+
+
+def _js_unescape(s):
+    if '\\' not in s:
+        return s
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '\\' and i + 1 < n:
+            nx = s[i + 1]
+            if nx == 'n':
+                out.append('\n'); i += 2
+            elif nx == 'r':
+                out.append('\r'); i += 2
+            elif nx == 't':
+                out.append('\t'); i += 2
+            elif nx == '"':
+                out.append('"'); i += 2
+            elif nx == '\\':
+                out.append('\\'); i += 2
+            elif nx == '/':
+                out.append('/'); i += 2
+            elif nx == 'b':
+                out.append('\b'); i += 2
+            elif nx == 'f':
+                out.append('\f'); i += 2
+            elif nx == 'u' and i + 5 < n:
+                try:
+                    out.append(chr(int(s[i + 2:i + 6], 16))); i += 6
+                except ValueError:
+                    out.append(nx); i += 2
+            else:
+                out.append(nx); i += 2
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+
+def _extract_rsc_routes(raw_html, base_url):
+    if '__next_f' not in raw_html:
+        return ()
+    chunks = []
+    for m in _RSC_PUSH_RE.finditer(raw_html):
+        chunks.append(_js_unescape(m.group(1)))
+        if len(chunks) > 500:
+            break
+    if not chunks:
+        return ()
+    payload = ''.join(chunks)
+    if len(payload) > 5_000_000:
+        payload = payload[:5_000_000]
+
+    out = []
+    seen = set()
+    for m in _RSC_HREF_RE.finditer(payload):
+        n = normalize(m.group(1), base_url)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+            if len(out) >= 2000:
+                return tuple(out)
+    for m in _RSC_ROUTE_RE.finditer(payload):
+        path = m.group(1)
+        if '//' in path:
+            continue
+        if path.endswith(('.js', '.css', '.png', '.jpg', '.jpeg', '.svg', '.json', '.woff', '.woff2')):
+            continue
+        n = normalize(path, base_url)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+            if len(out) >= 2000:
+                return tuple(out)
+    return tuple(out)
+
+
+def _walk_json_for_urls(obj, base_url, out, seen, depth=0):
+    if depth > 12 or len(out) >= 2000:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, str):
+                if k in ('url', '@id', 'sameAs', 'href', 'canonicalUrl', 'link', 'permalink', 'path'):
+                    if v.startswith(('http://', 'https://', '/')):
+                        n = normalize(v, base_url)
+                        if n and n not in seen:
+                            seen.add(n)
+                            out.append(n)
+            elif isinstance(v, (dict, list)):
+                _walk_json_for_urls(v, base_url, out, seen, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj[:500]:
+            _walk_json_for_urls(item, base_url, out, seen, depth + 1)
+
+
+def _extract_structured_links(raw_bytes, raw_text, base_url):
+    out = []
+    seen = set()
+
+    if b'application/ld+json' in raw_bytes[:300_000]:
+        for m in _JSONLD_RE.finditer(raw_bytes):
+            try:
+                data = json.loads(m.group(1))
+                _walk_json_for_urls(data, base_url, out, seen)
+            except Exception:
+                continue
+            if len(out) >= 2000:
+                return tuple(out)
+
+    if b'window.__NUXT__' in raw_bytes:
+        idx = raw_text.find('window.__NUXT__')
+        if idx > 0:
+            try:
+                end = raw_text.find('</script>', idx)
+                if end < 0:
+                    end = min(idx + 500_000, len(raw_text))
+                snippet = raw_text[idx:end]
+                eq = snippet.find('=')
+                if eq > 0:
+                    js = snippet[eq + 1:].strip().rstrip(';').strip()
+                    if js.startswith('{') or js.startswith('['):
+                        data = json.loads(js)
+                        _walk_json_for_urls(data, base_url, out, seen)
+            except Exception:
+                pass
+
+    if b'__APOLLO_STATE__' in raw_bytes or b'__INITIAL_STATE__' in raw_bytes or b'__PRELOADED_STATE__' in raw_bytes:
+        for marker in ('__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__'):
+            idx = raw_text.find(marker)
+            if idx < 0:
+                continue
+            try:
+                eq = raw_text.find('=', idx)
+                if eq < 0 or eq - idx > 100:
+                    continue
+                start = eq + 1
+                while start < len(raw_text) and raw_text[start] in ' \t\n':
+                    start += 1
+                if start >= len(raw_text) or raw_text[start] not in '{[':
+                    continue
+                depth = 0
+                i = start
+                in_str = False
+                esc = False
+                limit = min(start + 2_000_000, len(raw_text))
+                while i < limit:
+                    c = raw_text[i]
+                    if esc:
+                        esc = False
+                    elif c == '\\':
+                        esc = True
+                    elif c == '"':
+                        in_str = not in_str
+                    elif not in_str:
+                        if c in '{[':
+                            depth += 1
+                        elif c in '}]':
+                            depth -= 1
+                            if depth == 0:
+                                break
+                    i += 1
+                if depth == 0 and i < limit:
+                    data = json.loads(raw_text[start:i + 1])
+                    _walk_json_for_urls(data, base_url, out, seen)
+            except Exception:
+                continue
+            if len(out) >= 2000:
+                break
+
+    return tuple(out)
 
 
 def _normalize_lang(raw):
@@ -742,8 +979,7 @@ def _code_quality_pass(text, cfg):
         return False
     if len(set(text)) < cfg['code_min_unique_chars']:
         return False
-    lines = text.count('\n') + 1
-    if lines < 2:
+    if text.count('\n') < 1:
         return False
     return True
 
@@ -777,32 +1013,50 @@ def _extract_code_selectolax(tree, cfg):
 def _extract_code_lxml(doc, cfg):
     blocks = []
     seen_text = set()
-    for sel in _CODE_SELECTORS_LIST:
-        if sel == 'pre':
-            nodes = doc.iter('pre')
-        elif sel.startswith('.'):
-            cls = sel[1:]
-            nodes = (n for n in doc.iter() if n.get('class') and cls in n.get('class').split())
-        else:
-            nodes = ()
-        for node in nodes:
-            try:
-                raw = node.text_content()
-            except Exception:
-                continue
-            if not raw:
-                continue
-            snippet = _clean_code_snippet(raw)
-            if not _code_quality_pass(snippet, cfg):
-                continue
-            if snippet in seen_text:
-                continue
-            cls = node.get('class') or ''
-            lang = _detect_lang(snippet, cls)
-            if lang == 'unknown':
-                continue
-            seen_text.add(snippet)
-            blocks.append({'lang': lang, 'snippet': snippet})
+    for node in doc.iter('pre'):
+        try:
+            raw = node.text_content()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        snippet = _clean_code_snippet(raw)
+        if not _code_quality_pass(snippet, cfg):
+            continue
+        if snippet in seen_text:
+            continue
+        cls = node.get('class') or ''
+        lang = _detect_lang(snippet, cls)
+        if lang == 'unknown':
+            continue
+        seen_text.add(snippet)
+        blocks.append({'lang': lang, 'snippet': snippet})
+        if len(blocks) >= cfg['code_max_blocks']:
+            break
+    if len(blocks) < cfg['code_max_blocks']:
+        for cls_name in ('highlight', 'codehilite', 'chroma', 'hljs'):
+            for node in doc.iter():
+                cls = node.get('class') or ''
+                if cls_name not in cls.split():
+                    continue
+                try:
+                    raw = node.text_content()
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                snippet = _clean_code_snippet(raw)
+                if not _code_quality_pass(snippet, cfg):
+                    continue
+                if snippet in seen_text:
+                    continue
+                lang = _detect_lang(snippet, cls)
+                if lang == 'unknown':
+                    continue
+                seen_text.add(snippet)
+                blocks.append({'lang': lang, 'snippet': snippet})
+                if len(blocks) >= cfg['code_max_blocks']:
+                    break
             if len(blocks) >= cfg['code_max_blocks']:
                 break
     return tuple(blocks)
@@ -815,7 +1069,88 @@ def _finalize_text(text):
     return text.strip()
 
 
-def _parse_selectolax(raw, base_url, cfg):
+def _extract_links_selectolax(tree, base_url):
+    links = []
+    seen = set()
+    for node in tree.css(_LINK_SELECTOR):
+        tag = node.tag
+        val = None
+        if tag in ('a', 'area'):
+            val = node.attributes.get('href')
+        elif tag in ('iframe', 'frame'):
+            val = node.attributes.get('src')
+        elif tag == 'link':
+            rel = (node.attributes.get('rel') or '').lower()
+            if rel in ('next', 'prev', 'canonical', 'alternate', 'amphtml', 'sitemap'):
+                val = node.attributes.get('href')
+        elif tag == 'meta':
+            he = (node.attributes.get('http-equiv') or '').lower()
+            if he == 'refresh':
+                content = node.attributes.get('content') or ''
+                mr = _META_REFRESH_RE.search(content)
+                if mr:
+                    val = mr.group(1)
+        if not val:
+            continue
+        n = normalize(val, base_url)
+        if n and n not in seen:
+            seen.add(n)
+            links.append(n)
+            if len(links) >= 5000:
+                return tuple(links)
+    for el in tree.css('[data-href],[data-url],[data-link]'):
+        for attr in ('data-href', 'data-url', 'data-link'):
+            val = el.attributes.get(attr)
+            if val:
+                n = normalize(val, base_url)
+                if n and n not in seen:
+                    seen.add(n)
+                    links.append(n)
+                break
+        if len(links) >= 5000:
+            break
+    return tuple(links)
+
+
+def _extract_links_lxml(doc, base_url):
+    links = []
+    seen = set()
+    for node in doc.iter():
+        tag = node.tag
+        val = None
+        if tag in ('a', 'area'):
+            val = node.get('href')
+        elif tag in ('iframe', 'frame'):
+            val = node.get('src')
+        elif tag == 'link':
+            rel = (node.get('rel') or '').lower()
+            if rel in ('next', 'prev', 'canonical', 'alternate', 'amphtml', 'sitemap'):
+                val = node.get('href')
+        elif tag == 'meta':
+            he = (node.get('http-equiv') or '').lower()
+            if he == 'refresh':
+                content = node.get('content') or ''
+                mr = _META_REFRESH_RE.search(content)
+                if mr:
+                    val = mr.group(1)
+        elif tag is not None:
+            for attr in ('data-href', 'data-url', 'data-link'):
+                v = node.get(attr)
+                if v:
+                    val = v
+                    break
+        if not val:
+            continue
+        n = normalize(val, base_url)
+        if n and n not in seen:
+            seen.add(n)
+            links.append(n)
+            if len(links) >= 5000:
+                return tuple(links)
+    return tuple(links)
+
+
+def _parse_selectolax(raw, raw_bytes, base_url, cfg):
     try:
         tree = _parser_cls(raw)
     except Exception:
@@ -834,45 +1169,16 @@ def _parse_selectolax(raw, base_url, cfg):
         if og:
             title = (og.attributes.get('content') or '')[:200]
 
-    links = []
-    seen = set()
-    for a in tree.css('a[href]'):
-        href = a.attributes.get('href')
-        if not href:
-            continue
-        n = normalize(href, base_url)
-        if n and n not in seen:
-            seen.add(n)
-            links.append(n)
-        if len(links) > 5000:
-            break
-
-    for el in tree.css('[data-href],[data-url],[data-link]'):
-        for attr in ('data-href', 'data-url', 'data-link'):
-            val = el.attributes.get(attr)
-            if val:
-                n = normalize(val, base_url)
-                if n and n not in seen:
-                    seen.add(n)
-                    links.append(n)
-                break
-
-    for m in tree.css('meta[http-equiv="refresh"]'):
-        content = m.attributes.get('content') or ''
-        mr = _META_REFRESH_RE.search(content)
-        if mr:
-            n = normalize(mr.group(1), base_url)
-            if n and n not in seen:
-                seen.add(n)
-                links.append(n)
-
-    for lk in tree.css('link[rel="next"],link[rel="prev"],link[rel="canonical"]'):
-        href = lk.attributes.get('href')
-        if href:
-            n = normalize(href, base_url)
-            if n and n not in seen:
-                seen.add(n)
-                links.append(n)
+    links = list(_extract_links_selectolax(tree, base_url))
+    seen = set(links)
+    for extra in _extract_rsc_routes(raw, base_url):
+        if extra not in seen:
+            seen.add(extra)
+            links.append(extra)
+    for extra in _extract_structured_links(raw_bytes, raw, base_url):
+        if extra not in seen:
+            seen.add(extra)
+            links.append(extra)
 
     code_blocks = _extract_code_selectolax(tree, cfg)
 
@@ -887,7 +1193,12 @@ def _parse_selectolax(raw, base_url, cfg):
     for tag in source.css(_KILL_SELECTOR):
         tag.decompose()
 
-    text = source.text(separator='\n') or ''
+    try:
+        text = source.text(separator='\n') or ''
+    except Exception:
+        text = ''
+    if len(text) > cfg['max_text_chars']:
+        text = text[:cfg['max_text_chars']]
     text = _finalize_text(text)
 
     if not text or len(text) < 50:
@@ -895,7 +1206,7 @@ def _parse_selectolax(raw, base_url, cfg):
     return (title or '[untitled]', text), tuple(links), code_blocks
 
 
-def _parse_lxml(raw, base_url, cfg):
+def _parse_lxml(raw, raw_bytes, base_url, cfg):
     try:
         doc = _parser_cls.document_fromstring(raw, base_url=base_url)
     except Exception:
@@ -916,48 +1227,16 @@ def _parse_lxml(raw, base_url, cfg):
         if og:
             title = og[0][:200]
 
-    links = []
-    seen = set()
-    for a in doc.iter('a'):
-        href = a.get('href')
-        if not href:
-            continue
-        n = normalize(href, base_url)
-        if n and n not in seen:
-            seen.add(n)
-            links.append(n)
-        if len(links) > 5000:
-            break
-
-    for el in doc.iter():
-        for attr in ('data-href', 'data-url', 'data-link'):
-            val = el.get(attr)
-            if val:
-                n = normalize(val, base_url)
-                if n and n not in seen:
-                    seen.add(n)
-                    links.append(n)
-                break
-
-    for m in doc.iter('meta'):
-        if (m.get('http-equiv') or '').lower() == 'refresh':
-            content = m.get('content') or ''
-            mr = _META_REFRESH_RE.search(content)
-            if mr:
-                n = normalize(mr.group(1), base_url)
-                if n and n not in seen:
-                    seen.add(n)
-                    links.append(n)
-
-    for lk in doc.iter('link'):
-        rel = (lk.get('rel') or '').lower()
-        if rel in ('next', 'prev', 'canonical'):
-            href = lk.get('href')
-            if href:
-                n = normalize(href, base_url)
-                if n and n not in seen:
-                    seen.add(n)
-                    links.append(n)
+    links = list(_extract_links_lxml(doc, base_url))
+    seen = set(links)
+    for extra in _extract_rsc_routes(raw, base_url):
+        if extra not in seen:
+            seen.add(extra)
+            links.append(extra)
+    for extra in _extract_structured_links(raw_bytes, raw, base_url):
+        if extra not in seen:
+            seen.add(extra)
+            links.append(extra)
 
     code_blocks = _extract_code_lxml(doc, cfg)
 
@@ -974,7 +1253,12 @@ def _parse_lxml(raw, base_url, cfg):
         if parent is not None:
             parent.remove(tag)
 
-    text = source.text_content()
+    try:
+        text = source.text_content()
+    except Exception:
+        text = ''
+    if len(text) > cfg['max_text_chars']:
+        text = text[:cfg['max_text_chars']]
     text = _finalize_text(text)
 
     if not text or len(text) < 50:
@@ -983,10 +1267,11 @@ def _parse_lxml(raw, base_url, cfg):
 
 
 def _parse_and_extract(raw, base_url):
+    raw_bytes = raw.encode('utf-8', 'ignore') if isinstance(raw, str) else raw
     cfg = CONFIG
     if _parser_mode == 'lexbor':
-        return _parse_selectolax(raw, base_url, cfg)
-    return _parse_lxml(raw, base_url, cfg)
+        return _parse_selectolax(raw, raw_bytes, base_url, cfg)
+    return _parse_lxml(raw, raw_bytes, base_url, cfg)
 
 
 def _pdf_extract_text(content_bytes):
@@ -1029,9 +1314,9 @@ def _pdf_ocr(content_bytes):
     try:
         images = conv(content_bytes, dpi=200, fmt='png')
         parts = []
-        max_pages = min(len(images), 50)
+        max_pages = min(len(images), CONFIG['ocr_pdf_max_pages'])
         for i in range(max_pages):
-            t = _image_ocr_bytes(_pil_image_to_bytes(images[i]))
+            t = _image_ocr_pil(images[i])
             if t:
                 parts.append(t)
         return '\n\n'.join(parts)
@@ -1039,12 +1324,34 @@ def _pdf_ocr(content_bytes):
         return None
 
 
-def _pil_image_to_bytes(img):
+def _image_ocr_pil(img):
+    ocr = _load_ocr()
+    if not ocr:
+        return None
     try:
-        from io import BytesIO
-        buf = BytesIO()
-        img.save(buf, format='PNG')
-        return buf.getvalue()
+        if img.mode not in ('L', 'RGB'):
+            img = img.convert('RGB')
+        if _cv2 and _np is not None:
+            try:
+                arr = _np.array(img.convert('L'))
+                h, w = arr.shape
+                if h < 200 or w < 200:
+                    scale = max(200 / h, 200 / w)
+                    arr = _cv2.resize(
+                        arr, (int(w * scale), int(h * scale)),
+                        interpolation=_cv2.INTER_CUBIC,
+                    )
+                    h, w = arr.shape
+                if h * w < 4_000_000:
+                    _, arr = _cv2.threshold(
+                        arr, 0, 255,
+                        _cv2.THRESH_BINARY | _cv2.THRESH_OTSU,
+                    )
+                img = _pil_image.fromarray(arr)
+            except Exception:
+                pass
+        text = _pytesseract.image_to_string(img)
+        return text.strip() if text else None
     except Exception:
         return None
 
@@ -1056,29 +1363,15 @@ def _image_ocr_bytes(content_bytes):
     try:
         from io import BytesIO
         img = _pil_image.open(BytesIO(content_bytes))
-        if img.mode not in ('L', 'RGB'):
-            img = img.convert('RGB')
-        if _cv2 and _np is not None:
-            try:
-                arr = _np.array(img.convert('L'))
-                h, w = arr.shape
-                if h < 200 or w < 200:
-                    scale = max(200 / h, 200 / w)
-                    arr = _cv2.resize(arr, (int(w * scale), int(h * scale)), interpolation=_cv2.INTER_CUBIC)
-                if h * w < 4_000_000:
-                    _, arr = _cv2.threshold(arr, 0, 255, _cv2.THRESH_BINARY | _cv2.THRESH_OTSU)
-                img = _pil_image.fromarray(arr)
-            except Exception:
-                pass
-        text = _pytesseract.image_to_string(img)
-        return text.strip() if text else None
+        return _image_ocr_pil(img)
     except Exception:
         return None
 
 
 def _extract_binary(content_bytes, content_type, url):
     if content_type == 'pdf':
-        title, text = _pdf_extract_text(content_bytes) or ('', '')
+        result = _pdf_extract_text(content_bytes)
+        title, text = result if result else ('', '')
         min_chars = CONFIG['ocr_min_text_chars']
         if len(text) < min_chars and CONFIG['ocr_enabled']:
             ocr_text = _pdf_ocr(content_bytes)
@@ -1110,31 +1403,38 @@ def _extract_binary(content_bytes, content_type, url):
     return None
 
 
-def _iter_existing_url_bytes():
+def _prefill_bloom_from_output(bloom):
     if not OUTPUT_FILE.exists():
         return
-    with OUTPUT_FILE.open('rb') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            yield line
-
-
-def _prefill_bloom_from_output(bloom):
-    needle = b'"url":"'
-    for line_bytes in _iter_existing_url_bytes():
-        try:
-            i = line_bytes.find(needle)
-            if i < 0:
-                continue
-            i += len(needle)
-            j = line_bytes.find(b'"', i)
-            if j < 0:
-                continue
-            bloom.add_bytes(line_bytes[i:j])
-        except Exception:
-            continue
+    json_parse_limit = 5000
+    try:
+        with OUTPUT_FILE.open('rb') as f:
+            count = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                count += 1
+                if count <= json_parse_limit:
+                    try:
+                        obj = json.loads(line)
+                        u = obj.get('url')
+                        if isinstance(u, str):
+                            bloom.add(u)
+                        continue
+                    except Exception:
+                        pass
+                needle = b'"url":"'
+                i = line.find(needle)
+                if i < 0:
+                    continue
+                i += len(needle)
+                j = line.find(b'"', i)
+                if j < 0:
+                    continue
+                bloom.add_bytes(line[i:j])
+    except Exception:
+        pass
 
 
 def _parse_retry_after(resp):
@@ -1156,13 +1456,18 @@ def _parse_retry_after(resp):
         return 0.0
 
 
+_SITEMAP_LOC_RE = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.IGNORECASE)
+
+
 class Crawler:
     __slots__ = (
         'bloom', 'queue', 'host_inflight', 'pool', 'spoof', 'gate',
         'rate_limiter', 'written', 'fetched', 'dropped', 'zero_link_pages',
         'errors', 'stop_flag', 'out_fd', 'stats_task', 'start_time',
-        'last_report_time', 'last_report_written', 'seed', 'ocr_sem',
-        'code_blocks_total', 'ocr_pages_total',
+        'last_report_time', 'last_report_written', 'seed', 'seed_host',
+        'seed_reinjections', 'seed_last_reinject', 'ocr_sem',
+        'code_blocks_total', 'ocr_pages_total', 'challenges_total',
+        'flaresolverr_session', 'flaresolverr_available', 'fs_checked',
     )
 
     def __init__(self):
@@ -1189,15 +1494,128 @@ class Crawler:
         self.last_report_time = self.start_time
         self.last_report_written = 0
         self.seed = ''
+        self.seed_host = ''
+        self.seed_reinjections = 0
+        self.seed_last_reinject = 0.0
         self.ocr_sem = None
         self.code_blocks_total = 0
         self.ocr_pages_total = 0
+        self.challenges_total = 0
+        self.flaresolverr_session = None
+        self.flaresolverr_available = None
+        self.fs_checked = False
+
+    async def _standalone_fetch(self, url, timeout=15):
+        SessionCls = _load_session_cls()
+        try:
+            async with SessionCls(impersonate='chrome136', timeout=timeout) as sess:
+                resp = await sess.get(url, allow_redirects=True, max_redirects=5)
+                if resp.status_code == 200:
+                    try:
+                        return resp.text
+                    except Exception:
+                        try:
+                            return resp.content.decode('utf-8', 'ignore')
+                        except Exception:
+                            return None
+        except Exception:
+            return None
+        return None
+
+    async def _seed_sitemaps(self, seed_url):
+        parsed = urlparse(seed_url)
+        base = f'{parsed.scheme}://{parsed.netloc}'
+        robots_url = f'{base}/robots.txt'
+        robots = None
+        try:
+            robots = await self._standalone_fetch(robots_url, timeout=10)
+        except Exception:
+            robots = None
+
+        sitemap_urls = []
+        if robots:
+            for line in robots.splitlines():
+                line = line.strip()
+                low = line.lower()
+                if low.startswith('sitemap:'):
+                    sm = line[8:].strip()
+                    if sm.startswith(('http://', 'https://')):
+                        sitemap_urls.append(sm)
+
+        if not sitemap_urls:
+            sitemap_urls.append(f'{base}/sitemap.xml')
+            sitemap_urls.append(f'{base}/sitemap_index.xml')
+
+        seen_sitemaps = set()
+        pages_added = 0
+        pending = deque(sitemap_urls[:CONFIG['sitemap_max_count']])
+        max_sitemaps = CONFIG['sitemap_max_count']
+        max_pages = CONFIG['sitemap_max_pages']
+
+        while pending and len(seen_sitemaps) < max_sitemaps and pages_added < max_pages:
+            sm_url = pending.popleft()
+            if sm_url in seen_sitemaps:
+                continue
+            seen_sitemaps.add(sm_url)
+            xml = await self._standalone_fetch(sm_url, timeout=20)
+            if not xml:
+                continue
+            low_xml = xml[:2000].lower()
+            locs = _SITEMAP_LOC_RE.findall(xml)
+            if '<sitemapindex' in low_xml:
+                for loc in locs[:20]:
+                    if loc not in seen_sitemaps and len(seen_sitemaps) + len(pending) < max_sitemaps:
+                        pending.append(loc)
+            else:
+                for loc in locs:
+                    n = normalize(loc)
+                    if n and n not in self.bloom:
+                        self.bloom.add(n)
+                        self.queue.append((n, seed_url, 1))
+                        pages_added += 1
+                        if pages_added >= max_pages:
+                            break
+        print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages', file=sys.stderr)
+
+    async def _flaresolverr_fetch(self, url):
+        if self.flaresolverr_available is False:
+            return None
+        try:
+            SessionCls = _load_session_cls()
+            if self.flaresolverr_session is None:
+                self.flaresolverr_session = SessionCls(
+                    timeout=CONFIG['flaresolverr_timeout'],
+                )
+            resp = await self.flaresolverr_session.post(
+                CONFIG['flaresolverr_endpoint'],
+                json={
+                    'cmd': 'request.get',
+                    'url': url,
+                    'maxTimeout': 60000,
+                },
+                timeout=CONFIG['flaresolverr_timeout'],
+            )
+            if resp.status_code != 200:
+                self.flaresolverr_available = False
+                return None
+            data = resp.json()
+            if data.get('status') != 'ok':
+                self.flaresolverr_available = False
+                return None
+            self.flaresolverr_available = True
+            solution = data.get('solution') or {}
+            html = solution.get('response')
+            return html if isinstance(html, str) and html else None
+        except Exception:
+            self.flaresolverr_available = False
+            return None
 
     async def run(self, seed):
         self.seed = seed
+        self.seed_host = host_of(seed)
         mode = _load_parser()
         if mode == 'none':
-            print('[!] no HTML parser available (install selectolax or lxml)', file=sys.stderr)
+            print('[!] no HTML parser available', file=sys.stderr)
             return
 
         _prefill_bloom_from_output(self.bloom)
@@ -1225,6 +1643,13 @@ class Crawler:
         print(f'[Nexus] sessions: {CONFIG["session_pool_size"]}  rotate={CONFIG["rotate_min"]}-{CONFIG["rotate_max"]}', file=sys.stderr)
         print(f'[Nexus] pdf:      {"pypdf" if pdf_ready else "unavailable"}', file=sys.stderr)
         print(f'[Nexus] ocr:      {"enabled" if ocr_ready else "disabled"}  workers={CONFIG["ocr_workers"]}', file=sys.stderr)
+        print('[Nexus] seeding sitemaps...', file=sys.stderr)
+
+        try:
+            await self._seed_sitemaps(seed)
+        except Exception as e:
+            print(f'[sitemaps] failed: {e}', file=sys.stderr)
+
         print('[Nexus] CTRL+C to stop.\n', file=sys.stderr)
 
         self.stats_task = asyncio.create_task(self._stats_loop())
@@ -1241,13 +1666,23 @@ class Crawler:
             except Exception:
                 pass
             try:
+                if self.flaresolverr_session is not None:
+                    await self.flaresolverr_session.close()
+            except Exception:
+                pass
+            try:
+                if self.out_fd >= 0:
+                    os.fsync(self.out_fd)
+            except Exception:
+                pass
+            PARSER_POOL.shutdown(wait=False)
+            OCR_POOL.shutdown(wait=False)
+            try:
                 if self.out_fd >= 0:
                     os.close(self.out_fd)
             except Exception:
                 pass
             await self.pool.stop()
-            PARSER_POOL.shutdown(wait=False)
-            OCR_POOL.shutdown(wait=False)
             self._final_report()
 
     async def _stats_loop(self):
@@ -1270,7 +1705,8 @@ class Crawler:
                 f'dropped={self.dropped}  errors={self.errors}  '
                 f'queue={len(self.queue)}  hosts={len(self.host_inflight)}  '
                 f'conc={self.gate.current}  zerolink={self.zero_link_pages}  '
-                f'code={self.code_blocks_total}  ocr={self.ocr_pages_total}',
+                f'code={self.code_blocks_total}  ocr={self.ocr_pages_total}  '
+                f'chal={self.challenges_total}',
                 file=sys.stderr,
             )
             self.last_report_time = t
@@ -1284,6 +1720,7 @@ class Crawler:
             f'dropped={self.dropped}  errors={self.errors}  '
             f'zerolink={self.zero_link_pages}  '
             f'code_blocks={self.code_blocks_total}  ocr_pages={self.ocr_pages_total}  '
+            f'challenges={self.challenges_total}  '
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
@@ -1296,7 +1733,19 @@ class Crawler:
             if qlen == 0:
                 idle_rounds += 1
                 if not self.host_inflight:
-                    await asyncio.sleep(CONFIG['idle_deep_sleep'] if idle_rounds > 100 else CONFIG['idle_sleep'])
+                    now = time.monotonic()
+                    if (self.seed_reinjections < CONFIG['seed_max_reinjections']
+                            and self.seed
+                            and idle_rounds > 20
+                            and now - self.seed_last_reinject > 5.0):
+                        self.seed_reinjections += 1
+                        self.seed_last_reinject = now
+                        self.queue.append((self.seed, '', 0))
+                        idle_rounds = 0
+                        continue
+                    await asyncio.sleep(
+                        CONFIG['idle_deep_sleep'] if idle_rounds > 100 else CONFIG['idle_sleep']
+                    )
                 else:
                     await asyncio.sleep(CONFIG['idle_sleep'])
                 continue
@@ -1317,7 +1766,7 @@ class Crawler:
                     continue
                 inflight = self.host_inflight.get(host, 0)
                 if inflight >= CONFIG['per_host_limit']:
-                    self.queue.append((url, referer, depth))
+                    self.queue.appendleft((url, referer, depth))
                     continue
                 self.host_inflight[host] = inflight + 1
                 tasks.append((url, referer, depth, host))
@@ -1357,7 +1806,7 @@ class Crawler:
                 self.dropped += 1
                 return
             bundle = self.pool.bundle_of(idx)
-            headers = self.spoof.build(bundle, referer)
+            headers = self.spoof.build(bundle, referer, host)
 
             try:
                 resp = await sess.get(
@@ -1417,6 +1866,18 @@ class Crawler:
                     return
                 if len(raw) > CONFIG['max_html_bytes']:
                     raw = raw[:CONFIG['max_html_bytes']]
+
+                if _is_challenge_response(raw, resp.content, status, resp.headers):
+                    self.challenges_total += 1
+                    solved = await self._flaresolverr_fetch(url)
+                    if solved:
+                        raw = solved
+                        if len(raw) > CONFIG['max_html_bytes']:
+                            raw = raw[:CONFIG['max_html_bytes']]
+                    else:
+                        self.dropped += 1
+                        return
+
                 try:
                     cleaned, links, code = await loop.run_in_executor(
                         PARSER_POOL, _parse_and_extract, raw, url
@@ -1457,7 +1918,9 @@ class Crawler:
                 if code:
                     record['code'] = list(code)
                     self.code_blocks_total += len(code)
-                line = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8') + b'\n'
+                line = json.dumps(
+                    record, ensure_ascii=False, separators=(',', ':')
+                ).encode('utf-8') + b'\n'
                 try:
                     os.write(self.out_fd, line)
                     self.written += 1
