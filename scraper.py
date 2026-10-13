@@ -54,6 +54,8 @@ CONFIG = {
     'sitemap_max_pages': 2000,
     'seed_max_reinjections': 3,
     'drop_log_limit': 30,
+    'host_403_blacklist_threshold': 5,
+    'impersonate_retry_limit': 2,
 }
 
 OUTPUT_FILE = Path(CONFIG['output_file'])
@@ -147,6 +149,38 @@ def _load_ocr():
     return _pytesseract
 
 
+def _valid_impersonate_keys():
+    try:
+        from curl_cffi.const import BrowserType
+        keys = set()
+        for b in BrowserType:
+            v = b.value
+            if isinstance(v, str):
+                keys.add(v)
+        if keys:
+            return keys
+    except Exception:
+        pass
+    return None
+
+
+def _probe_impersonations():
+    valid = _valid_impersonate_keys()
+    working = set()
+    for b in _UA_BUNDLES:
+        key = b['key']
+        if key in working or key in _BAD_IMPERSONATIONS:
+            continue
+        if valid is None:
+            working.add(key)
+            continue
+        if key in valid:
+            working.add(key)
+        else:
+            _BAD_IMPERSONATIONS.add(key)
+    return working
+
+
 class BloomFilter:
     __slots__ = ('bits', 'num_bits', 'num_hashes', 'mask')
 
@@ -198,13 +232,16 @@ class BloomFilter:
 
 
 class DomainState:
-    __slots__ = ('delay', 'fails', 'last_hit', 'limit', 'success_run')
+    __slots__ = ('delay', 'fails', 'last_hit', 'limit', 'success_run',
+                 'consecutive_403', 'blacklisted')
     def __init__(self, base_limit):
         self.delay = 0.0
         self.fails = 0
         self.last_hit = 0.0
         self.limit = base_limit
         self.success_run = 0
+        self.consecutive_403 = 0
+        self.blacklisted = False
 
 
 class RateLimitTracker:
@@ -222,6 +259,10 @@ class RateLimitTracker:
         if state is None:
             return self.base_limit
         return state.limit
+
+    def is_blacklisted(self, host):
+        state = self.domains.get(host)
+        return state is not None and state.blacklisted
 
     async def wait(self, host):
         state = self.domains.get(host)
@@ -242,6 +283,7 @@ class RateLimitTracker:
                         self.domains[host] = state
             state.last_hit = time.monotonic()
             state.success_run += 1
+            state.consecutive_403 = 0
             if state.success_run >= 20 and state.limit < self.max_limit:
                 state.success_run = 0
                 state.limit = min(self.max_limit, state.limit + 2)
@@ -259,7 +301,14 @@ class RateLimitTracker:
                 state.success_run = 0
                 state.limit = max(self.min_limit, state.limit // 2)
                 state.delay = min(180.0, max(0.5, state.delay * 2.0) * random.uniform(0.8, 1.2))
-            elif status in (403, 401):
+            elif status == 403:
+                state.fails += 1
+                state.success_run = 0
+                state.limit = max(self.min_limit, state.limit // 2)
+                state.consecutive_403 += 1
+                if state.consecutive_403 >= CONFIG['host_403_blacklist_threshold']:
+                    state.blacklisted = True
+            elif status == 401:
                 state.fails += 1
                 state.success_run = 0
                 state.limit = max(self.min_limit, state.limit // 2)
@@ -420,19 +469,6 @@ def _make_ua_bundles():
 
 _UA_BUNDLES = _make_ua_bundles()
 _BAD_IMPERSONATIONS = set()
-
-
-def _probe_impersonations():
-    SessionCls = _load_session_cls()
-    working = set()
-    candidates = list({b['key'] for b in _UA_BUNDLES})
-    for key in candidates:
-        try:
-            SessionCls(impersonate=key, timeout=2)
-            working.add(key)
-        except Exception:
-            _BAD_IMPERSONATIONS.add(key)
-    return working
 
 
 class SpoofEngine:
@@ -1512,6 +1548,7 @@ class Crawler:
         'flaresolverr_session', 'flaresolverr_available', 'fs_checked',
         'flare_sem', 'challenged_hosts', 'resolved_hosts',
         'drop_log_count', 'drop_reasons', 'impersonate_errors',
+        'blacklisted_hosts',
     )
 
     def __init__(self):
@@ -1554,6 +1591,7 @@ class Crawler:
         self.drop_log_count = 0
         self.drop_reasons = {}
         self.impersonate_errors = 0
+        self.blacklisted_hosts = set()
 
     def _log_drop(self, reason, url):
         self.dropped += 1
@@ -1562,14 +1600,55 @@ class Crawler:
             self.drop_log_count += 1
             print(f'[drop:{reason}] {url[:110]}', file=sys.stderr)
 
-    async def _standalone_fetch(self, url, timeout=15, use_flare=True):
-        if use_flare and url:
-            host = host_of(url)
-            if host in self.challenged_hosts and host in self.resolved_hosts:
-                solved = await self._flaresolverr_fetch(url)
-                if solved:
-                    return solved
+    async def _probe_flare(self):
+        base = CONFIG['flaresolverr_endpoint'].rsplit('/v1', 1)[0]
+        health = f'{base}/health'
+        SessionCls = _load_session_cls()
+        try:
+            async with SessionCls(timeout=3, impersonate='chrome136') as sess:
+                resp = await sess.get(health)
+                if resp.status_code == 200:
+                    self.flaresolverr_available = True
+                    print('[flare] available', file=sys.stderr)
+                    return
+        except Exception:
+            pass
+        self.flaresolverr_available = False
+        print('[flare] NOT running — Cloudflare-challenged sites will be dropped', file=sys.stderr)
+        print('[flare] to enable: docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest', file=sys.stderr)
 
+    async def _flaresolverr_fetch(self, url):
+        if self.flaresolverr_available is not True:
+            return None
+        try:
+            SessionCls = _load_session_cls()
+            if self.flaresolverr_session is None:
+                self.flaresolverr_session = SessionCls(timeout=CONFIG['flaresolverr_timeout'])
+            resp = await self.flaresolverr_session.post(
+                CONFIG['flaresolverr_endpoint'],
+                json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
+                timeout=CONFIG['flaresolverr_timeout'],
+            )
+            if resp.status_code != 200:
+                self.flaresolverr_available = False
+                print('[flare] endpoint returned non-200 — disabling flare for this run', file=sys.stderr)
+                return None
+            data = resp.json()
+            if data.get('status') != 'ok':
+                solution = data.get('solution') or {}
+                html = solution.get('response')
+                if isinstance(html, str) and html:
+                    return html
+                return None
+            solution = data.get('solution') or {}
+            html = solution.get('response')
+            return html if isinstance(html, str) and html else None
+        except Exception as e:
+            self.flaresolverr_available = False
+            print(f'[flare] {type(e).__name__}: {e} — disabling flare for this run', file=sys.stderr)
+            return None
+
+    async def _standalone_fetch(self, url, timeout=15, use_flare=True):
         SessionCls = _load_session_cls()
         valid = [b['key'] for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
         key = random.choice(valid) if valid else 'chrome136'
@@ -1600,7 +1679,7 @@ class Crawler:
         except Exception:
             raw = None
 
-        if use_flare and status in (403, 503, 429):
+        if use_flare and self.flaresolverr_available is True and status in (403, 503, 429):
             if _is_challenge_response(raw or '', body_bytes, status, headers):
                 host = host_of(url)
                 if host:
@@ -1665,36 +1744,6 @@ class Crawler:
                             break
         print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages', file=sys.stderr)
 
-    async def _flaresolverr_fetch(self, url):
-        if self.flaresolverr_available is False:
-            return None
-        try:
-            SessionCls = _load_session_cls()
-            if self.flaresolverr_session is None:
-                self.flaresolverr_session = SessionCls(timeout=CONFIG['flaresolverr_timeout'])
-            resp = await self.flaresolverr_session.post(
-                CONFIG['flaresolverr_endpoint'],
-                json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
-                timeout=CONFIG['flaresolverr_timeout'],
-            )
-            if resp.status_code != 200:
-                self.flaresolverr_available = False
-                print('[flare] endpoint not reachable (FlareSolverr not running?)', file=sys.stderr)
-                return None
-            data = resp.json()
-            if data.get('status') != 'ok':
-                self.flaresolverr_available = False
-                print(f'[flare] error: {data.get("message", "unknown")}', file=sys.stderr)
-                return None
-            self.flaresolverr_available = True
-            solution = data.get('solution') or {}
-            html = solution.get('response')
-            return html if isinstance(html, str) and html else None
-        except Exception as e:
-            self.flaresolverr_available = False
-            print(f'[flare] {type(e).__name__}: {e}', file=sys.stderr)
-            return None
-
     async def run(self, seed):
         self.seed = seed
         self.seed_host = host_of(seed)
@@ -1742,8 +1791,10 @@ class Crawler:
         print(f'[Nexus] per-host: {CONFIG["per_host_base"]} base, {CONFIG["per_host_min"]}-{CONFIG["per_host_max"]} adaptive', file=sys.stderr)
         print(f'[Nexus] pdf:      {"pypdf" if pdf_ready else "unavailable"}', file=sys.stderr)
         print(f'[Nexus] ocr:      {"enabled" if ocr_ready else "disabled"}  workers={CONFIG["ocr_workers"]}', file=sys.stderr)
-        print('[Nexus] seeding sitemaps...', file=sys.stderr)
 
+        await self._probe_flare()
+
+        print('[Nexus] seeding sitemaps...', file=sys.stderr)
         try:
             await self._seed_sitemaps(seed)
         except Exception as e:
@@ -1805,7 +1856,8 @@ class Crawler:
                 f'queue={len(self.queue)}  hosts={len(self.host_inflight)}  '
                 f'conc={self.gate.current}  zerolink={self.zero_link_pages}  '
                 f'code={self.code_blocks_total}  ocr={self.ocr_pages_total}  '
-                f'chal={self.challenges_total}  imp-err={self.impersonate_errors}',
+                f'chal={self.challenges_total}  imp-err={self.impersonate_errors}  '
+                f'bl={len(self.blacklisted_hosts)}',
                 file=sys.stderr,
             )
             self.last_report_time = t
@@ -1823,6 +1875,8 @@ class Crawler:
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
+        if self.blacklisted_hosts:
+            print(f'[blacklisted hosts] {sorted(self.blacklisted_hosts)}', file=sys.stderr)
         if self.drop_reasons:
             print('[drop reasons]', file=sys.stderr)
             for r, c in sorted(self.drop_reasons.items(), key=lambda x: -x[1]):
@@ -1830,7 +1884,6 @@ class Crawler:
 
     async def _worker(self, wid):
         idle_rounds = 0
-        popleft = self.queue.popleft
         while not self.stop_flag:
             qlen = len(self.queue)
             if qlen == 0:
@@ -1858,7 +1911,7 @@ class Crawler:
             batch = []
             try:
                 for _ in range(batch_size):
-                    batch.append(popleft())
+                    batch.append(self.queue.popleft())
             except IndexError:
                 pass
 
@@ -1866,6 +1919,11 @@ class Crawler:
             for url, referer, depth in batch:
                 host = host_of(url)
                 if not host:
+                    continue
+                if host in self.blacklisted_hosts or self.rate_limiter.is_blacklisted(host):
+                    if host not in self.blacklisted_hosts:
+                        self.blacklisted_hosts.add(host)
+                    self.dropped += 1
                     continue
                 inflight = self.host_inflight.get(host, 0)
                 host_limit = self.rate_limiter.limit_for(host)
@@ -1902,64 +1960,69 @@ class Crawler:
         await self.rate_limiter.wait(host)
         await self.gate.acquire()
         try:
-            idx = self.pool.pick()
-            sess = self.pool.get(idx)
-            if sess is None:
-                self.pool.force_rotate(idx)
-                asyncio.create_task(self.pool.rotate(idx))
-                self._log_drop('no-session', url)
-                return
-            bundle = self.pool.bundle_of(idx)
-            if bundle is None:
-                self.pool.force_rotate(idx)
-                asyncio.create_task(self.pool.rotate(idx))
-                self._log_drop('no-bundle', url)
-                return
-            headers = self.spoof.build(bundle, referer, host)
-
             resp = None
             body_bytes = b''
             raw = None
-            try:
-                resp = await sess.get(
-                    url,
-                    headers=headers,
-                    timeout=CONFIG['request_timeout'],
-                    allow_redirects=True,
-                    max_redirects=CONFIG['max_redirects'],
-                )
-                status = resp.status_code
+            resp_headers = {}
+
+            for attempt in range(CONFIG['impersonate_retry_limit'] + 1):
+                idx = self.pool.pick()
+                sess = self.pool.get(idx)
+                if sess is None:
+                    self.pool.force_rotate(idx)
+                    await self.pool.rotate(idx)
+                    continue
+                bundle = self.pool.bundle_of(idx)
+                if bundle is None:
+                    continue
+                headers = self.spoof.build(bundle, referer, host)
                 try:
-                    body_bytes = resp.content or b''
-                except Exception:
-                    body_bytes = b''
-                try:
-                    raw = resp.text
-                except Exception:
+                    resp = await sess.get(
+                        url,
+                        headers=headers,
+                        timeout=CONFIG['request_timeout'],
+                        allow_redirects=True,
+                        max_redirects=CONFIG['max_redirects'],
+                    )
+                    status = resp.status_code
                     try:
-                        raw = body_bytes.decode('utf-8', 'ignore')
+                        body_bytes = resp.content or b''
                     except Exception:
-                        raw = None
-            except Exception as e:
-                status = 0
-                err_name = type(e).__name__
-                self.pool.bump(idx)
-                if 'Impersonate' in err_name:
-                    self.impersonate_errors += 1
-                    self.pool.blacklist_current(idx)
-                    asyncio.create_task(self.pool.rotate(idx))
-                    self._log_drop('impersonate-error', url)
+                        body_bytes = b''
+                    try:
+                        raw = resp.text
+                    except Exception:
+                        try:
+                            raw = body_bytes.decode('utf-8', 'ignore')
+                        except Exception:
+                            raw = None
+                    self.pool.bump(idx)
+                    if self.pool.needs_rotation(idx):
+                        asyncio.create_task(self.pool.rotate(idx))
+                    break
+                except Exception as e:
+                    err_name = type(e).__name__
+                    self.pool.bump(idx)
+                    if 'Impersonate' in err_name:
+                        self.impersonate_errors += 1
+                        self.pool.blacklist_current(idx)
+                        try:
+                            await self.pool.rotate(idx)
+                        except Exception:
+                            pass
+                        continue
+                    if self.pool.needs_rotation(idx):
+                        asyncio.create_task(self.pool.rotate(idx))
+                    self._log_drop(f'fetch-{err_name}', url)
                     return
-                if self.pool.needs_rotation(idx):
-                    asyncio.create_task(self.pool.rotate(idx))
-                self._log_drop(f'fetch-{err_name}', url)
+            else:
+                self._log_drop('impersonate-retry-exhausted', url)
                 return
 
-            self.pool.bump(idx)
-            if self.pool.needs_rotation(idx):
-                asyncio.create_task(self.pool.rotate(idx))
+            if resp is None:
+                self._log_drop('no-response', url)
+                return
 
-            resp_headers = {}
             try:
                 resp_headers = dict(resp.headers)
             except Exception:
@@ -1969,20 +2032,25 @@ class Crawler:
 
             is_chal = _is_challenge_response(raw or '', body_bytes, status, resp_headers)
 
-            if is_chal and self.flaresolverr_available is not False:
+            if is_chal:
                 self.challenges_total += 1
                 self.challenged_hosts.add(host)
-                async with self.flare_sem:
-                    solved = await self._flaresolverr_fetch(url)
-                if solved:
-                    self.resolved_hosts.add(host)
-                    raw = solved
-                    body_bytes = solved.encode('utf-8', 'ignore') if isinstance(solved, str) else body_bytes
-                    status = 200
-                    if not ctype:
-                        ctype = 'text/html'
-            elif is_chal and host not in self.resolved_hosts:
-                self.challenges_total += 1
+                if self.flaresolverr_available is True:
+                    async with self.flare_sem:
+                        solved = await self._flaresolverr_fetch(url)
+                    if solved:
+                        self.resolved_hosts.add(host)
+                        raw = solved
+                        body_bytes = solved.encode('utf-8', 'ignore') if isinstance(solved, str) else body_bytes
+                        status = 200
+                        if not ctype:
+                            ctype = 'text/html'
+                    else:
+                        self._log_drop('challenge-unsolved', url)
+                        return
+                else:
+                    self._log_drop(f'challenge-no-flare-{status}', url)
+                    return
 
             if status != 200:
                 if status in (403, 429, 502, 503, 520, 521, 522, 523, 524):
