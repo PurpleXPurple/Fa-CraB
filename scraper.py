@@ -14,10 +14,10 @@ from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 
 
 CONFIG = {
-    'initial_concurrency': 400,
-    'min_concurrency': 120,
-    'max_concurrency': 2000,
-    'session_pool_size': 48,
+    'initial_concurrency': 200,
+    'min_concurrency': 64,
+    'max_concurrency': 1200,
+    'session_pool_size': 32,
     'rotate_min': 150,
     'rotate_max': 350,
     'request_timeout': 12,
@@ -25,14 +25,14 @@ CONFIG = {
     'max_binary_bytes': 8_000_000,
     'max_text_chars': 200_000,
     'max_redirects': 5,
-    'queue_high_water': 500_000,
+    'queue_high_water': 200_000,
     'stats_interval': 2.0,
     'idle_sleep': 0.001,
     'idle_deep_sleep': 1.0,
     'output_file': 'output.json',
-    'bloom_expected': 150_000_000,
+    'bloom_expected': 20_000_000,
     'bloom_error': 0.001,
-    'parser_workers': max(8, (os.cpu_count() or 4) * 2),
+    'parser_workers': max(6, (os.cpu_count() or 4) + 2),
     'ocr_workers': 4,
     'ocr_concurrency': 4,
     'ocr_enabled': True,
@@ -44,7 +44,9 @@ CONFIG = {
     'code_min_unique_chars': 8,
     'batch_pop': 8,
     'batch_pop_small': 4,
-    'per_host_limit': 6,
+    'per_host_base': 8,
+    'per_host_max': 32,
+    'per_host_min': 2,
     'flaresolverr_endpoint': 'http://localhost:8191/v1',
     'flaresolverr_timeout': 70,
     'flaresolverr_concurrency': 3,
@@ -196,19 +198,30 @@ class BloomFilter:
 
 
 class DomainState:
-    __slots__ = ('delay', 'fails', 'last_hit')
-    def __init__(self):
+    __slots__ = ('delay', 'fails', 'last_hit', 'limit', 'success_run')
+    def __init__(self, base_limit):
         self.delay = 0.0
         self.fails = 0
         self.last_hit = 0.0
+        self.limit = base_limit
+        self.success_run = 0
 
 
 class RateLimitTracker:
-    __slots__ = ('domains', '_lock')
+    __slots__ = ('domains', '_lock', 'base_limit', 'min_limit', 'max_limit')
 
     def __init__(self):
         self.domains = {}
         self._lock = asyncio.Lock()
+        self.base_limit = CONFIG['per_host_base']
+        self.min_limit = CONFIG['per_host_min']
+        self.max_limit = CONFIG['per_host_max']
+
+    def limit_for(self, host):
+        state = self.domains.get(host)
+        if state is None:
+            return self.base_limit
+        return state.limit
 
     async def wait(self, host):
         state = self.domains.get(host)
@@ -221,22 +234,35 @@ class RateLimitTracker:
     async def record(self, host, status, retry_after=0.0):
         state = self.domains.get(host)
         if status == 200 and retry_after == 0.0 and (state is None or state.delay <= 0.0):
-            if state is not None:
-                state.last_hit = time.monotonic()
+            if state is None:
+                async with self._lock:
+                    state = self.domains.get(host)
+                    if state is None:
+                        state = DomainState(self.base_limit)
+                        self.domains[host] = state
+            state.last_hit = time.monotonic()
+            state.success_run += 1
+            if state.success_run >= 20 and state.limit < self.max_limit:
+                state.success_run = 0
+                state.limit = min(self.max_limit, state.limit + 2)
             return
         async with self._lock:
             state = self.domains.get(host)
             if state is None:
-                state = DomainState()
+                state = DomainState(self.base_limit)
                 self.domains[host] = state
             state.last_hit = time.monotonic()
             if retry_after > 0:
                 state.delay = max(state.delay, min(retry_after, 300.0))
             if status in (429, 503, 502, 520, 521, 522, 523, 524):
                 state.fails += 1
+                state.success_run = 0
+                state.limit = max(self.min_limit, state.limit // 2)
                 state.delay = min(180.0, max(0.5, state.delay * 2.0) * random.uniform(0.8, 1.2))
             elif status in (403, 401):
                 state.fails += 1
+                state.success_run = 0
+                state.limit = max(self.min_limit, state.limit // 2)
                 state.delay = min(90.0, max(0.8, state.delay * 1.6))
             elif status == 200:
                 state.fails = 0
@@ -338,17 +364,16 @@ def _make_ua_bundles():
     bundles = []
     for v, key in (
         ('136', 'chrome136'),
-        ('133', 'chrome133a'),
         ('131', 'chrome131'),
         ('124', 'chrome124'),
         ('120', 'chrome120'),
         ('116', 'chrome116'),
+        ('110', 'chrome110'),
     ):
         for plat, sec_plat, sec_ver in (
             ('Windows NT 10.0; Win64; x64', '"Windows"', '"10.0.0"'),
             ('Windows NT 11.0; Win64; x64', '"Windows"', '"11.0.0"'),
             ('Macintosh; Intel Mac OS X 14_7', '"macOS"', '"14.7.0"'),
-            ('Macintosh; Intel Mac OS X 15_2', '"macOS"', '"15.2.0"'),
             ('X11; Linux x86_64', '"Linux"', '"6.5.0"'),
         ):
             bundles.append({
@@ -360,22 +385,22 @@ def _make_ua_bundles():
                 'major_ver': v,
                 'chromium': True,
             })
-    for ver in ('18.4', '17.6', '18.2'):
+    for ver in ('17.6', '17.0', '16.5'):
         for plat in (
             'Macintosh; Intel Mac OS X 14_7',
             'Macintosh; Intel Mac OS X 13_6',
-            'Macintosh; Intel Mac OS X 15_2',
+            'Macintosh; Intel Mac OS X 12_7',
         ):
             bundles.append({
                 'ua': f'Mozilla/5.0 ({plat}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{ver} Safari/605.1.15',
-                'key': 'safari184',
+                'key': 'safari170',
                 'sec_plat': '"macOS"',
                 'sec_plat_ver': '"14.7.0"',
                 'full_ver': None,
                 'major_ver': ver.split('.')[0],
                 'chromium': False,
             })
-    for ver, key in (('135', 'firefox135'), ('133', 'firefox133'), ('128', 'firefox128')):
+    for ver in ('133', '128', '120'):
         for plat, sec_plat in (
             ('Windows NT 10.0; Win64; x64', '"Windows"'),
             ('Macintosh; Intel Mac OS X 14.7', '"macOS"'),
@@ -383,7 +408,7 @@ def _make_ua_bundles():
         ):
             bundles.append({
                 'ua': f'Mozilla/5.0 ({plat}; rv:{ver}.0) Gecko/20100101 Firefox/{ver}.0',
-                'key': key,
+                'key': 'firefox133' if ver == '133' else ('firefox128' if ver == '128' else 'firefox120'),
                 'sec_plat': sec_plat,
                 'sec_plat_ver': '"10.0.0"',
                 'full_ver': None,
@@ -394,6 +419,24 @@ def _make_ua_bundles():
 
 
 _UA_BUNDLES = _make_ua_bundles()
+_BAD_IMPERSONATIONS = set()
+
+
+def _probe_impersonations():
+    SessionCls = _load_session_cls()
+    working = set()
+    candidates = list({b['key'] for b in _UA_BUNDLES})
+    for key in candidates:
+        try:
+            s = SessionCls(impersonate=key, timeout=2)
+            try:
+                s.close() if not asyncio.iscoroutinefunction(s.close) else None
+            except Exception:
+                pass
+            working.add(key)
+        except Exception:
+            _BAD_IMPERSONATIONS.add(key)
+    return working
 
 
 class SpoofEngine:
@@ -462,19 +505,33 @@ class SessionPool:
         self.locks = [asyncio.Lock() for _ in range(size)]
 
     async def start(self):
-        SessionCls = _load_session_cls()
         for i in range(self.size):
-            b = random.choice(_UA_BUNDLES)
+            b = self._pick_bundle()
             self.bundles[i] = b
-            self.sessions[i] = self._make(SessionCls, b['key'])
+            self.sessions[i] = self._make(b['key'])
             self.thresholds[i] = random.randint(CONFIG['rotate_min'], CONFIG['rotate_max'])
 
     @staticmethod
-    def _make(SessionCls, key):
+    def _pick_bundle():
+        valid = [b for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
+        if not valid:
+            valid = _UA_BUNDLES
+        return random.choice(valid)
+
+    @staticmethod
+    def _make(key):
+        SessionCls = _load_session_cls()
         try:
             return SessionCls(impersonate=key, timeout=CONFIG['request_timeout'])
         except Exception:
-            return SessionCls(impersonate='chrome136', timeout=CONFIG['request_timeout'])
+            _BAD_IMPERSONATIONS.add(key)
+            fallback = [b for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
+            if not fallback:
+                return None
+            try:
+                return SessionCls(impersonate=fallback[0]['key'], timeout=CONFIG['request_timeout'])
+            except Exception:
+                return None
 
     async def stop(self):
         await asyncio.gather(
@@ -501,6 +558,12 @@ class SessionPool:
     def force_rotate(self, idx):
         self.hits[idx] = self.thresholds[idx]
 
+    def blacklist_current(self, idx):
+        b = self.bundles[idx]
+        if b is not None:
+            _BAD_IMPERSONATIONS.add(b['key'])
+        self.hits[idx] = self.thresholds[idx]
+
     async def rotate(self, idx):
         async with self.locks[idx]:
             if self.hits[idx] < self.thresholds[idx]:
@@ -511,10 +574,9 @@ class SessionPool:
                     await old.close()
                 except Exception:
                     pass
-            SessionCls = _load_session_cls()
-            b = random.choice(_UA_BUNDLES)
+            b = self._pick_bundle()
             self.bundles[idx] = b
-            self.sessions[idx] = self._make(SessionCls, b['key'])
+            self.sessions[idx] = self._make(b['key'])
             self.hits[idx] = 0
             self.thresholds[idx] = random.randint(CONFIG['rotate_min'], CONFIG['rotate_max'])
 
@@ -1440,7 +1502,7 @@ class Crawler:
         'code_blocks_total', 'ocr_pages_total', 'challenges_total',
         'flaresolverr_session', 'flaresolverr_available', 'fs_checked',
         'flare_sem', 'challenged_hosts', 'resolved_hosts',
-        'drop_log_count', 'drop_reasons',
+        'drop_log_count', 'drop_reasons', 'impersonate_errors',
     )
 
     def __init__(self):
@@ -1482,6 +1544,7 @@ class Crawler:
         self.resolved_hosts = set()
         self.drop_log_count = 0
         self.drop_reasons = {}
+        self.impersonate_errors = 0
 
     def _log_drop(self, reason, url):
         self.dropped += 1
@@ -1499,12 +1562,14 @@ class Crawler:
                     return solved
 
         SessionCls = _load_session_cls()
+        valid = [b['key'] for b in _UA_BUNDLES if b['key'] not in _BAD_IMPERSONATIONS]
+        key = random.choice(valid) if valid else 'chrome136'
         raw = None
         status = 0
         headers = {}
         body_bytes = b''
         try:
-            async with SessionCls(impersonate='chrome136', timeout=timeout) as sess:
+            async with SessionCls(impersonate=key, timeout=timeout) as sess:
                 resp = await sess.get(url, allow_redirects=True, max_redirects=5)
                 status = resp.status_code
                 try:
@@ -1574,7 +1639,9 @@ class Crawler:
             xml = await self._standalone_fetch(sm_url, timeout=20)
             if not xml:
                 continue
-            low_xml = xml[:2000].lower()
+            if sm_url.endswith('.gz') or xml[:2] == '\x1f\x8b':
+                continue
+            low_xml = xml[:3000].lower()
             locs = _SITEMAP_LOC_RE.findall(xml)
             if '<sitemapindex' in low_xml:
                 for loc in locs[:20]:
@@ -1605,20 +1672,17 @@ class Crawler:
             )
             if resp.status_code != 200:
                 self.flaresolverr_available = False
-                print('[flare] endpoint not reachable (is the container running?)', file=sys.stderr)
                 return None
             data = resp.json()
             if data.get('status') != 'ok':
                 self.flaresolverr_available = False
-                print(f'[flare] error: {data.get("message", "unknown")}', file=sys.stderr)
                 return None
             self.flaresolverr_available = True
             solution = data.get('solution') or {}
             html = solution.get('response')
             return html if isinstance(html, str) and html else None
-        except Exception as e:
+        except Exception:
             self.flaresolverr_available = False
-            print(f'[flare] exception: {type(e).__name__}: {e}', file=sys.stderr)
             return None
 
     async def run(self, seed):
@@ -1628,6 +1692,18 @@ class Crawler:
         if mode == 'none':
             print('[!] no HTML parser available', file=sys.stderr)
             return
+
+        global _UA_BUNDLES
+        before = len({b['key'] for b in _UA_BUNDLES})
+        working = _probe_impersonations()
+        if working:
+            _UA_BUNDLES = [b for b in _UA_BUNDLES if b['key'] in working]
+        after = len({b['key'] for b in _UA_BUNDLES})
+        if after == 0:
+            print('[!] no valid impersonations in installed curl_cffi', file=sys.stderr)
+            return
+        if before != after:
+            print(f'[impersonate] dropped {before - after} invalid keys, using: {sorted(set(b["key"] for b in _UA_BUNDLES))}', file=sys.stderr)
 
         _prefill_bloom_from_output(self.bloom)
         self.bloom.add(seed)
@@ -1653,6 +1729,7 @@ class Crawler:
         print(f'[Nexus] engine:   {engine}  parsers={CONFIG["parser_workers"]}', file=sys.stderr)
         print(f'[Nexus] adaptive: {CONFIG["min_concurrency"]}-{CONFIG["max_concurrency"]} (start {CONFIG["initial_concurrency"]})', file=sys.stderr)
         print(f'[Nexus] sessions: {CONFIG["session_pool_size"]}  rotate={CONFIG["rotate_min"]}-{CONFIG["rotate_max"]}', file=sys.stderr)
+        print(f'[Nexus] per-host: {CONFIG["per_host_base"]} base, {CONFIG["per_host_min"]}-{CONFIG["per_host_max"]} adaptive', file=sys.stderr)
         print(f'[Nexus] pdf:      {"pypdf" if pdf_ready else "unavailable"}', file=sys.stderr)
         print(f'[Nexus] ocr:      {"enabled" if ocr_ready else "disabled"}  workers={CONFIG["ocr_workers"]}', file=sys.stderr)
         print('[Nexus] seeding sitemaps...', file=sys.stderr)
@@ -1718,7 +1795,7 @@ class Crawler:
                 f'queue={len(self.queue)}  hosts={len(self.host_inflight)}  '
                 f'conc={self.gate.current}  zerolink={self.zero_link_pages}  '
                 f'code={self.code_blocks_total}  ocr={self.ocr_pages_total}  '
-                f'chal={self.challenges_total}',
+                f'chal={self.challenges_total}  imp-err={self.impersonate_errors}',
                 file=sys.stderr,
             )
             self.last_report_time = t
@@ -1732,7 +1809,7 @@ class Crawler:
             f'dropped={self.dropped}  errors={self.errors}  '
             f'zerolink={self.zero_link_pages}  '
             f'code_blocks={self.code_blocks_total}  ocr_pages={self.ocr_pages_total}  '
-            f'challenges={self.challenges_total}  '
+            f'challenges={self.challenges_total}  imp-errors={self.impersonate_errors}  '
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
@@ -1781,7 +1858,8 @@ class Crawler:
                 if not host:
                     continue
                 inflight = self.host_inflight.get(host, 0)
-                if inflight >= CONFIG['per_host_limit']:
+                host_limit = self.rate_limiter.limit_for(host)
+                if inflight >= host_limit:
                     self.queue.appendleft((url, referer, depth))
                     continue
                 self.host_inflight[host] = inflight + 1
@@ -1822,6 +1900,11 @@ class Crawler:
                 self._log_drop('no-session', url)
                 return
             bundle = self.pool.bundle_of(idx)
+            if bundle is None:
+                self.pool.force_rotate(idx)
+                asyncio.create_task(self.pool.rotate(idx))
+                self._log_drop('no-bundle', url)
+                return
             headers = self.spoof.build(bundle, referer, host)
 
             resp = None
@@ -1849,10 +1932,17 @@ class Crawler:
                         raw = None
             except Exception as e:
                 status = 0
+                err_name = type(e).__name__
                 self.pool.bump(idx)
+                if 'Impersonate' in err_name:
+                    self.impersonate_errors += 1
+                    self.pool.blacklist_current(idx)
+                    asyncio.create_task(self.pool.rotate(idx))
+                    self._log_drop('impersonate-error', url)
+                    return
                 if self.pool.needs_rotation(idx):
                     asyncio.create_task(self.pool.rotate(idx))
-                self._log_drop(f'fetch-{type(e).__name__}', url)
+                self._log_drop(f'fetch-{err_name}', url)
                 return
 
             self.pool.bump(idx)
