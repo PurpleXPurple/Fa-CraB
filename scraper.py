@@ -47,9 +47,11 @@ CONFIG = {
     'per_host_limit': 6,
     'flaresolverr_endpoint': 'http://localhost:8191/v1',
     'flaresolverr_timeout': 70,
+    'flaresolverr_concurrency': 3,
     'sitemap_max_count': 50,
     'sitemap_max_pages': 2000,
     'seed_max_reinjections': 3,
+    'drop_log_limit': 30,
 }
 
 OUTPUT_FILE = Path(CONFIG['output_file'])
@@ -402,10 +404,7 @@ class SpoofEngine:
         ip = _IP_POOL
         if referer:
             ref_host = host_of(referer)
-            if ref_host == target_host:
-                sec_site = 'same-origin'
-            else:
-                sec_site = 'cross-site'
+            sec_site = 'same-origin' if ref_host == target_host else 'cross-site'
         else:
             sec_site = 'none'
         h = {
@@ -619,10 +618,7 @@ def normalize(url, base=''):
     if not netloc or '.' not in netloc or len(netloc) > 253:
         return None
     path = p.path
-    if len(path) > 60:
-        path_check = path[:60] + path[-40:] if len(path) > 100 else path
-    else:
-        path_check = path
+    path_check = path if len(path) <= 100 else path[:60] + path[-40:]
     if '.' in path_check and _SKIP_EXT.search(path_check):
         return None
     if _HARD_SKIP_PATH_RE.search(path):
@@ -718,7 +714,8 @@ _JSONLD_RE = re.compile(
 )
 
 _CHALLENGE_TITLE_RE = re.compile(
-    r'just a moment|attention required|checking your browser|verifying you are human|ddos protection|cf-browser-verification',
+    r'just a moment|attention required|checking your browser|verifying you are human|'
+    r'ddos protection|cf-browser-verification|cf_chl_|enable javascript and cookies',
     re.IGNORECASE,
 )
 
@@ -726,7 +723,11 @@ _CHALLENGE_BODY_MARKERS = (
     b'cf-chl-', b'__cf_chl_', b'turnstile', b'challenge-platform',
     b'cf_chl_opt', b'/cdn-cgi/challenge-platform', b'cf-please-wait',
     b'<title>just a moment', b'<title>attention required',
+    b'checking your browser', b'verifying you are human',
+    b'cf-challenge', b'cloudflare ray id',
 )
+
+_CHALLENGE_STATUS = (403, 503, 429)
 
 
 def _is_challenge_response(raw_text, raw_bytes, status, headers):
@@ -736,8 +737,13 @@ def _is_challenge_response(raw_text, raw_bytes, status, headers):
             return True
     except Exception:
         pass
+    try:
+        server = (headers.get('server') or headers.get('Server') or '').lower()
+        is_cf = 'cloudflare' in server
+    except Exception:
+        is_cf = False
     if raw_bytes:
-        head = raw_bytes[:30000].lower()
+        head = raw_bytes[:40_000].lower()
         for marker in _CHALLENGE_BODY_MARKERS:
             if marker in head:
                 return True
@@ -745,6 +751,8 @@ def _is_challenge_response(raw_text, raw_bytes, status, headers):
         m = re.search(r'<title[^>]*>([^<]{1,200})</title>', raw_text, re.IGNORECASE)
         if m and _CHALLENGE_TITLE_RE.search(m.group(1)):
             return True
+    if is_cf and status in _CHALLENGE_STATUS:
+        return True
     return False
 
 
@@ -874,48 +882,49 @@ def _extract_structured_links(raw_bytes, raw_text, base_url):
             except Exception:
                 pass
 
-    if b'__APOLLO_STATE__' in raw_bytes or b'__INITIAL_STATE__' in raw_bytes or b'__PRELOADED_STATE__' in raw_bytes:
-        for marker in ('__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__'):
-            idx = raw_text.find(marker)
-            if idx < 0:
+    for marker in ('__APOLLO_STATE__', '__INITIAL_STATE__', '__PRELOADED_STATE__'):
+        if marker.encode() not in raw_bytes:
+            continue
+        idx = raw_text.find(marker)
+        if idx < 0:
+            continue
+        try:
+            eq = raw_text.find('=', idx)
+            if eq < 0 or eq - idx > 100:
                 continue
-            try:
-                eq = raw_text.find('=', idx)
-                if eq < 0 or eq - idx > 100:
-                    continue
-                start = eq + 1
-                while start < len(raw_text) and raw_text[start] in ' \t\n':
-                    start += 1
-                if start >= len(raw_text) or raw_text[start] not in '{[':
-                    continue
-                depth = 0
-                i = start
-                in_str = False
-                esc = False
-                limit = min(start + 2_000_000, len(raw_text))
-                while i < limit:
-                    c = raw_text[i]
-                    if esc:
-                        esc = False
-                    elif c == '\\':
-                        esc = True
-                    elif c == '"':
-                        in_str = not in_str
-                    elif not in_str:
-                        if c in '{[':
-                            depth += 1
-                        elif c in '}]':
-                            depth -= 1
-                            if depth == 0:
-                                break
-                    i += 1
-                if depth == 0 and i < limit:
-                    data = json.loads(raw_text[start:i + 1])
-                    _walk_json_for_urls(data, base_url, out, seen)
-            except Exception:
+            start = eq + 1
+            while start < len(raw_text) and raw_text[start] in ' \t\n':
+                start += 1
+            if start >= len(raw_text) or raw_text[start] not in '{[':
                 continue
-            if len(out) >= 2000:
-                break
+            depth = 0
+            i = start
+            in_str = False
+            esc = False
+            limit = min(start + 2_000_000, len(raw_text))
+            while i < limit:
+                c = raw_text[i]
+                if esc:
+                    esc = False
+                elif c == '\\':
+                    esc = True
+                elif c == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if c in '{[':
+                        depth += 1
+                    elif c in '}]':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                i += 1
+            if depth == 0 and i < limit:
+                data = json.loads(raw_text[start:i + 1])
+                _walk_json_for_urls(data, base_url, out, seen)
+        except Exception:
+            continue
+        if len(out) >= 2000:
+            break
 
     return tuple(out)
 
@@ -1033,32 +1042,6 @@ def _extract_code_lxml(doc, cfg):
         blocks.append({'lang': lang, 'snippet': snippet})
         if len(blocks) >= cfg['code_max_blocks']:
             break
-    if len(blocks) < cfg['code_max_blocks']:
-        for cls_name in ('highlight', 'codehilite', 'chroma', 'hljs'):
-            for node in doc.iter():
-                cls = node.get('class') or ''
-                if cls_name not in cls.split():
-                    continue
-                try:
-                    raw = node.text_content()
-                except Exception:
-                    continue
-                if not raw:
-                    continue
-                snippet = _clean_code_snippet(raw)
-                if not _code_quality_pass(snippet, cfg):
-                    continue
-                if snippet in seen_text:
-                    continue
-                lang = _detect_lang(snippet, cls)
-                if lang == 'unknown':
-                    continue
-                seen_text.add(snippet)
-                blocks.append({'lang': lang, 'snippet': snippet})
-                if len(blocks) >= cfg['code_max_blocks']:
-                    break
-            if len(blocks) >= cfg['code_max_blocks']:
-                break
     return tuple(blocks)
 
 
@@ -1080,16 +1063,12 @@ def _extract_links_selectolax(tree, base_url):
         elif tag in ('iframe', 'frame'):
             val = node.attributes.get('src')
         elif tag == 'link':
-            rel = (node.attributes.get('rel') or '').lower()
-            if rel in ('next', 'prev', 'canonical', 'alternate', 'amphtml', 'sitemap'):
-                val = node.attributes.get('href')
+            val = node.attributes.get('href')
         elif tag == 'meta':
-            he = (node.attributes.get('http-equiv') or '').lower()
-            if he == 'refresh':
-                content = node.attributes.get('content') or ''
-                mr = _META_REFRESH_RE.search(content)
-                if mr:
-                    val = mr.group(1)
+            content = node.attributes.get('content') or ''
+            mr = _META_REFRESH_RE.search(content)
+            if mr:
+                val = mr.group(1)
         if not val:
             continue
         n = normalize(val, base_url)
@@ -1123,9 +1102,7 @@ def _extract_links_lxml(doc, base_url):
         elif tag in ('iframe', 'frame'):
             val = node.get('src')
         elif tag == 'link':
-            rel = (node.get('rel') or '').lower()
-            if rel in ('next', 'prev', 'canonical', 'alternate', 'amphtml', 'sitemap'):
-                val = node.get('href')
+            val = node.get('href')
         elif tag == 'meta':
             he = (node.get('http-equiv') or '').lower()
             if he == 'refresh':
@@ -1337,16 +1314,10 @@ def _image_ocr_pil(img):
                 h, w = arr.shape
                 if h < 200 or w < 200:
                     scale = max(200 / h, 200 / w)
-                    arr = _cv2.resize(
-                        arr, (int(w * scale), int(h * scale)),
-                        interpolation=_cv2.INTER_CUBIC,
-                    )
+                    arr = _cv2.resize(arr, (int(w * scale), int(h * scale)), interpolation=_cv2.INTER_CUBIC)
                     h, w = arr.shape
                 if h * w < 4_000_000:
-                    _, arr = _cv2.threshold(
-                        arr, 0, 255,
-                        _cv2.THRESH_BINARY | _cv2.THRESH_OTSU,
-                    )
+                    _, arr = _cv2.threshold(arr, 0, 255, _cv2.THRESH_BINARY | _cv2.THRESH_OTSU)
                 img = _pil_image.fromarray(arr)
             except Exception:
                 pass
@@ -1468,6 +1439,8 @@ class Crawler:
         'seed_reinjections', 'seed_last_reinject', 'ocr_sem',
         'code_blocks_total', 'ocr_pages_total', 'challenges_total',
         'flaresolverr_session', 'flaresolverr_available', 'fs_checked',
+        'flare_sem', 'challenged_hosts', 'resolved_hosts',
+        'drop_log_count', 'drop_reasons',
     )
 
     def __init__(self):
@@ -1504,23 +1477,64 @@ class Crawler:
         self.flaresolverr_session = None
         self.flaresolverr_available = None
         self.fs_checked = False
+        self.flare_sem = None
+        self.challenged_hosts = set()
+        self.resolved_hosts = set()
+        self.drop_log_count = 0
+        self.drop_reasons = {}
 
-    async def _standalone_fetch(self, url, timeout=15):
+    def _log_drop(self, reason, url):
+        self.dropped += 1
+        self.drop_reasons[reason] = self.drop_reasons.get(reason, 0) + 1
+        if self.drop_log_count < CONFIG['drop_log_limit']:
+            self.drop_log_count += 1
+            print(f'[drop:{reason}] {url[:110]}', file=sys.stderr)
+
+    async def _standalone_fetch(self, url, timeout=15, use_flare=True):
+        if use_flare and url:
+            host = host_of(url)
+            if host in self.challenged_hosts and host in self.resolved_hosts:
+                solved = await self._flaresolverr_fetch(url)
+                if solved:
+                    return solved
+
         SessionCls = _load_session_cls()
+        raw = None
+        status = 0
+        headers = {}
+        body_bytes = b''
         try:
             async with SessionCls(impersonate='chrome136', timeout=timeout) as sess:
                 resp = await sess.get(url, allow_redirects=True, max_redirects=5)
-                if resp.status_code == 200:
+                status = resp.status_code
+                try:
+                    headers = dict(resp.headers)
+                except Exception:
+                    headers = {}
+                try:
+                    body_bytes = resp.content or b''
+                except Exception:
+                    body_bytes = b''
+                if status == 200:
                     try:
-                        return resp.text
+                        raw = resp.text
                     except Exception:
                         try:
-                            return resp.content.decode('utf-8', 'ignore')
+                            raw = body_bytes.decode('utf-8', 'ignore')
                         except Exception:
-                            return None
+                            raw = None
         except Exception:
-            return None
-        return None
+            raw = None
+
+        if use_flare and status in (403, 503, 429):
+            if _is_challenge_response(raw or '', body_bytes, status, headers):
+                host = host_of(url)
+                if host:
+                    self.challenged_hosts.add(host)
+                solved = await self._flaresolverr_fetch(url)
+                if solved:
+                    return solved
+        return raw
 
     async def _seed_sitemaps(self, seed_url):
         parsed = urlparse(seed_url)
@@ -1528,7 +1542,7 @@ class Crawler:
         robots_url = f'{base}/robots.txt'
         robots = None
         try:
-            robots = await self._standalone_fetch(robots_url, timeout=10)
+            robots = await self._standalone_fetch(robots_url, timeout=15)
         except Exception:
             robots = None
 
@@ -1583,31 +1597,28 @@ class Crawler:
         try:
             SessionCls = _load_session_cls()
             if self.flaresolverr_session is None:
-                self.flaresolverr_session = SessionCls(
-                    timeout=CONFIG['flaresolverr_timeout'],
-                )
+                self.flaresolverr_session = SessionCls(timeout=CONFIG['flaresolverr_timeout'])
             resp = await self.flaresolverr_session.post(
                 CONFIG['flaresolverr_endpoint'],
-                json={
-                    'cmd': 'request.get',
-                    'url': url,
-                    'maxTimeout': 60000,
-                },
+                json={'cmd': 'request.get', 'url': url, 'maxTimeout': 60000},
                 timeout=CONFIG['flaresolverr_timeout'],
             )
             if resp.status_code != 200:
                 self.flaresolverr_available = False
+                print('[flare] endpoint not reachable (is the container running?)', file=sys.stderr)
                 return None
             data = resp.json()
             if data.get('status') != 'ok':
                 self.flaresolverr_available = False
+                print(f'[flare] error: {data.get("message", "unknown")}', file=sys.stderr)
                 return None
             self.flaresolverr_available = True
             solution = data.get('solution') or {}
             html = solution.get('response')
             return html if isinstance(html, str) and html else None
-        except Exception:
+        except Exception as e:
             self.flaresolverr_available = False
+            print(f'[flare] exception: {type(e).__name__}: {e}', file=sys.stderr)
             return None
 
     async def run(self, seed):
@@ -1623,6 +1634,7 @@ class Crawler:
         self.queue.append((seed, '', 0))
 
         self.ocr_sem = asyncio.Semaphore(CONFIG['ocr_concurrency'])
+        self.flare_sem = asyncio.Semaphore(CONFIG['flaresolverr_concurrency'])
         self.pool = SessionPool(CONFIG['session_pool_size'])
         await self.pool.start()
 
@@ -1724,6 +1736,10 @@ class Crawler:
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
+        if self.drop_reasons:
+            print('[drop reasons]', file=sys.stderr)
+            for r, c in sorted(self.drop_reasons.items(), key=lambda x: -x[1]):
+                print(f'  {r}: {c}', file=sys.stderr)
 
     async def _worker(self, wid):
         idle_rounds = 0
@@ -1803,11 +1819,14 @@ class Crawler:
             if sess is None:
                 self.pool.force_rotate(idx)
                 asyncio.create_task(self.pool.rotate(idx))
-                self.dropped += 1
+                self._log_drop('no-session', url)
                 return
             bundle = self.pool.bundle_of(idx)
             headers = self.spoof.build(bundle, referer, host)
 
+            resp = None
+            body_bytes = b''
+            raw = None
             try:
                 resp = await sess.get(
                     url,
@@ -1817,93 +1836,122 @@ class Crawler:
                     max_redirects=CONFIG['max_redirects'],
                 )
                 status = resp.status_code
-            except Exception:
+                try:
+                    body_bytes = resp.content or b''
+                except Exception:
+                    body_bytes = b''
+                try:
+                    raw = resp.text
+                except Exception:
+                    try:
+                        raw = body_bytes.decode('utf-8', 'ignore')
+                    except Exception:
+                        raw = None
+            except Exception as e:
                 status = 0
                 self.pool.bump(idx)
                 if self.pool.needs_rotation(idx):
                     asyncio.create_task(self.pool.rotate(idx))
-                self.dropped += 1
+                self._log_drop(f'fetch-{type(e).__name__}', url)
                 return
 
             self.pool.bump(idx)
             if self.pool.needs_rotation(idx):
                 asyncio.create_task(self.pool.rotate(idx))
 
+            resp_headers = {}
+            try:
+                resp_headers = dict(resp.headers)
+            except Exception:
+                pass
+
+            ctype = (resp_headers.get('content-type') or resp_headers.get('Content-Type') or '').lower()
+
+            is_chal = _is_challenge_response(raw or '', body_bytes, status, resp_headers)
+
+            if is_chal or (host in self.challenged_hosts and host not in self.resolved_hosts):
+                self.challenges_total += 1
+                self.challenged_hosts.add(host)
+                async with self.flare_sem:
+                    solved = await self._flaresolverr_fetch(url)
+                if solved:
+                    self.resolved_hosts.add(host)
+                    raw = solved
+                    body_bytes = solved.encode('utf-8', 'ignore') if isinstance(solved, str) else body_bytes
+                    status = 200
+                    if not ctype:
+                        ctype = 'text/html'
+                else:
+                    self._log_drop('challenge-unsolved', url)
+                    return
+
             if status != 200:
                 if status in (403, 429, 502, 503, 520, 521, 522, 523, 524):
                     self.pool.force_rotate(idx)
                     asyncio.create_task(self.pool.rotate(idx))
-                if status in (429, 503):
+                if status in (429, 503) and resp is not None:
                     retry_after = _parse_retry_after(resp)
-                self.dropped += 1
+                self._log_drop(f'status-{status}', url)
                 return
 
-            ctype = (resp.headers.get('content-type') or '').lower()
             content_type = None
-            if 'text/html' in ctype or 'application/xhtml' in ctype:
+            if 'text/html' in ctype or 'application/xhtml' in ctype or not ctype:
                 content_type = 'html'
             elif 'application/pdf' in ctype:
                 content_type = 'pdf'
             elif ctype.startswith('image/'):
                 content_type = 'image'
             else:
-                self.dropped += 1
+                self._log_drop(f'ctype-{ctype[:40]}', url)
                 return
 
             loop = asyncio.get_running_loop()
 
             if content_type == 'html':
-                try:
-                    raw = resp.text
-                except Exception:
-                    try:
-                        raw = resp.content.decode('utf-8', 'ignore')
-                    except Exception:
-                        self.dropped += 1
-                        return
                 if not raw:
-                    self.dropped += 1
+                    self._log_drop('empty-html', url)
                     return
                 if len(raw) > CONFIG['max_html_bytes']:
                     raw = raw[:CONFIG['max_html_bytes']]
 
-                if _is_challenge_response(raw, resp.content, status, resp.headers):
+                if _is_challenge_response(raw, raw.encode('utf-8', 'ignore'), 200, resp_headers):
                     self.challenges_total += 1
-                    solved = await self._flaresolverr_fetch(url)
+                    self.challenged_hosts.add(host)
+                    async with self.flare_sem:
+                        solved = await self._flaresolverr_fetch(url)
                     if solved:
-                        raw = solved
-                        if len(raw) > CONFIG['max_html_bytes']:
-                            raw = raw[:CONFIG['max_html_bytes']]
+                        self.resolved_hosts.add(host)
+                        raw = solved[:CONFIG['max_html_bytes']]
                     else:
-                        self.dropped += 1
+                        self._log_drop('challenge-unsolved-200', url)
                         return
 
                 try:
                     cleaned, links, code = await loop.run_in_executor(
                         PARSER_POOL, _parse_and_extract, raw, url
                     )
-                except Exception:
-                    self.dropped += 1
+                except Exception as e:
+                    self._log_drop(f'parse-{type(e).__name__}', url)
                     return
             else:
-                try:
-                    content = resp.content
-                except Exception:
-                    self.dropped += 1
+                if not body_bytes:
+                    try:
+                        body_bytes = resp.content or b''
+                    except Exception:
+                        body_bytes = b''
+                if not body_bytes:
+                    self._log_drop('empty-binary', url)
                     return
-                if not content:
-                    self.dropped += 1
-                    return
-                if len(content) > CONFIG['max_binary_bytes']:
-                    self.dropped += 1
+                if len(body_bytes) > CONFIG['max_binary_bytes']:
+                    self._log_drop('binary-too-large', url)
                     return
                 async with self.ocr_sem:
                     try:
                         cleaned = await loop.run_in_executor(
-                            OCR_POOL, _extract_binary, content, content_type, url
+                            OCR_POOL, _extract_binary, body_bytes, content_type, url
                         )
-                    except Exception:
-                        self.dropped += 1
+                    except Exception as e:
+                        self._log_drop(f'ocr-{type(e).__name__}', url)
                         return
                 links = ()
                 code = ()
@@ -1918,9 +1966,7 @@ class Crawler:
                 if code:
                     record['code'] = list(code)
                     self.code_blocks_total += len(code)
-                line = json.dumps(
-                    record, ensure_ascii=False, separators=(',', ':')
-                ).encode('utf-8') + b'\n'
+                line = json.dumps(record, ensure_ascii=False, separators=(',', ':')).encode('utf-8') + b'\n'
                 try:
                     os.write(self.out_fd, line)
                     self.written += 1
@@ -1928,6 +1974,9 @@ class Crawler:
                     print(f'[write] {e}', file=sys.stderr)
                     self.stop_flag = True
                     return
+            else:
+                if content_type == 'html':
+                    self._log_drop('empty-text', url)
 
             if not links:
                 self.zero_link_pages += 1
