@@ -14,11 +14,11 @@ from urllib.parse import urljoin, urlparse, urldefrag, parse_qsl, urlencode
 
 
 CONFIG = {
-    'max_active_hosts': 64,
-    'workers_per_host': 32,
-    'max_concurrency': 4000,
-    'min_concurrency': 128,
-    'session_pool_size': 64,
+    'max_active_hosts': 512,
+    'workers_per_host_min': 2,
+    'workers_per_host_max': 32,
+    'max_concurrency': 1024,           # hard global cap on network calls in flight
+    'session_pool_size': 96,
     'rotate_min': 400,
     'rotate_max': 800,
     'request_timeout': 12,
@@ -26,7 +26,6 @@ CONFIG = {
     'max_binary_bytes': 10_000_000,
     'max_text_chars': 200_000,
     'max_redirects': 5,
-    'queue_high_water': 2_000_000,
     'max_links_per_page': 20_000,
     'stats_interval': 3.0,
     'output_file': 'output.json',
@@ -39,12 +38,15 @@ CONFIG = {
     'ocr_min_text_chars': 100,
     'ocr_max_chars': 400_000,
     'ocr_pdf_max_pages': 10,
-    'host_idle_timeout': 15.0,
-    'dispatch_interval': 0.25,
+    'host_idle_timeout': 5.0,
+    'dispatch_interval': 0.2,
     'host_403_blacklist_threshold': 5,
+    'host_challenge_blacklist_threshold': 3,
     'impersonate_retry_limit': 2,
     'drop_log_limit': 15,
     'min_text_chars': 20,
+    'sitemap_max_count': 50,
+    'sitemap_max_pages': 5000,
 }
 
 OUTPUT_FILE = Path(CONFIG['output_file'])
@@ -92,28 +94,26 @@ def _load_parser():
 
 
 def _load_pdf():
-    """Prefer PyMuPDF (10-30x faster than pypdf, renders pages for OCR natively)."""
     global _pdf_module, _pdf_mode
     if _pdf_mode is not None:
         return _pdf_mode
     for modname in ('pymupdf', 'fitz'):
         try:
-            mod = __import__(modname)
-            _pdf_module = mod
+            _pdf_module = __import__(modname)
             _pdf_mode = 'pymupdf'
             return _pdf_mode
         except ImportError:
             continue
     try:
-        import pypdf as _pypdf
-        _pdf_module = _pypdf
+        import pypdf as _p
+        _pdf_module = _p
         _pdf_mode = 'pypdf'
         return _pdf_mode
     except ImportError:
         pass
     try:
-        import PyPDF2 as _pypdf2
-        _pdf_module = _pypdf2
+        import PyPDF2 as _p
+        _pdf_module = _p
         _pdf_mode = 'pypdf'
         return _pdf_mode
     except ImportError:
@@ -183,7 +183,7 @@ class BloomFilter:
 
 
 # ===========================================================================
-# Rate limiting — delay + blacklist only (concurrency is worker-count bound)
+# Per-host rate limiting — delay + blacklist, NOT concurrency
 # ===========================================================================
 
 class DomainState:
@@ -218,6 +218,7 @@ class RateLimitTracker:
 
     async def record(self, host, status, retry_after=0.0):
         st = self.domains.get(host)
+        # Fast path: clean 200 with no delay already set.
         if status == 200 and retry_after == 0.0 and (st is None or st.delay <= 0.0):
             if st is None:
                 async with self._lock:
@@ -235,10 +236,10 @@ class RateLimitTracker:
                 self.domains[host] = st
             st.last_hit = time.monotonic()
             if retry_after > 0:
-                st.delay = max(st.delay, min(retry_after, 300.0))
+                st.delay = max(st.delay, min(retry_after, 60.0))
             if status in (429, 503, 502, 520, 521, 522, 523, 524):
                 st.fails += 1
-                st.delay = min(120.0, max(0.3, st.delay * 2.0) * random.uniform(0.8, 1.2))
+                st.delay = min(60.0, max(0.3, st.delay * 2.0) * random.uniform(0.8, 1.2))
             elif status == 403:
                 st.fails += 1
                 st.consecutive_403 += 1
@@ -246,70 +247,14 @@ class RateLimitTracker:
                     st.blacklisted = True
             elif status == 401:
                 st.fails += 1
-                st.delay = min(60.0, max(0.5, st.delay * 1.6))
+                st.delay = min(30.0, max(0.5, st.delay * 1.5))
             elif status == 200:
                 st.fails = 0
-                st.delay = max(0.0, st.delay * 0.7 - 0.1)
+                st.delay = max(0.0, st.delay * 0.5)
 
 
 # ===========================================================================
-# Global adaptive gate — backstop against mass failures
-# ===========================================================================
-
-class AdaptiveGate:
-    __slots__ = ('limit', 'min_lim', 'max_lim', 'inflight',
-                 '_cond', '_results', '_failures', '_releases')
-
-    def __init__(self, initial, min_lim, max_lim):
-        self.limit = initial
-        self.min_lim = min_lim
-        self.max_lim = max_lim
-        self.inflight = 0
-        self._cond = asyncio.Condition()
-        self._results = deque()
-        self._failures = 0
-        self._releases = 0
-
-    async def acquire(self):
-        async with self._cond:
-            while self.inflight >= self.limit:
-                await self._cond.wait()
-            self.inflight += 1
-
-    async def release(self, status):
-        async with self._cond:
-            self.inflight -= 1
-            if len(self._results) >= 256:
-                if self._results.popleft() >= 400:
-                    self._failures -= 1
-            self._results.append(status)
-            if status >= 400:
-                self._failures += 1
-            self._releases += 1
-            if self._releases >= 64:
-                self._releases = 0
-                self._adjust()
-            self._cond.notify(1)
-
-    def _adjust(self):
-        n = len(self._results)
-        if n < 200:
-            return
-        rate = self._failures / n
-        if rate > 0.25:
-            self.limit = max(self.min_lim, int(self.limit * 0.75))
-        elif rate > 0.15:
-            self.limit = max(self.min_lim, int(self.limit * 0.90))
-        elif rate < 0.03 and self.limit < self.max_lim:
-            self.limit = min(self.max_lim, int(self.limit * 1.15))
-
-    @property
-    def current(self):
-        return self.limit
-
-
-# ===========================================================================
-# Headers
+# Header spoofing
 # ===========================================================================
 
 _ACCEPT_LANGS = (
@@ -394,7 +339,7 @@ class SessionPool:
             self.thresholds[i] = random.randint(CONFIG['rotate_min'], CONFIG['rotate_max'])
 
     def _make(self, SessionCls):
-        for _ in range(3):
+        for _ in range(6):
             key = random.choice(self.keys)
             try:
                 return SessionCls(impersonate=key, timeout=CONFIG['request_timeout'])
@@ -451,6 +396,29 @@ _BAD_SCHEMES = (
     'intent:', 'market:', 'itms:', 'itms-apps:', 'bitcoin:', 'ethereum:',
 )
 
+# Asset / CDN hosts — skip before we even normalize
+_SKIP_HOSTS_RE = re.compile(
+    r'^('
+    r'fonts\.googleapis\.com|fonts\.gstatic\.com|www\.gstatic\.com|'
+    r'ajax\.googleapis\.com|maps\.googleapis\.com|'
+    r'cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fastly\.jsdelivr\.net|'
+    r'unpkg\.com|esm\.sh|cdn\.skypack\.dev|'
+    r'googletagmanager\.com|www\.googletagmanager\.com|'
+    r'google-analytics\.com|www\.google-analytics\.com|ssl\.google-analytics\.com|'
+    r'doubleclick\.net|static\.doubleclick\.net|googlesyndication\.com|'
+    r'connect\.facebook\.net|graph\.facebook\.com|'
+    r'platform\.twitter\.com|syndication\.twitter\.com|'
+    r'analytics\.tiktok\.com|'
+    r'cdn\.segment\.com|api\.segment\.io|'
+    r'static\.hotjar\.com|script\.hotjar\.com|'
+    r'bat\.bing\.com|clarity\.ms|'
+    r'cdn\.onesignal\.com|'
+    r'fonts\.bunny\.net|'
+    r'cdn\.tailwindcss\.com'
+    r')$',
+    re.IGNORECASE,
+)
+
 _SKIP_EXT = re.compile(
     r'\.(png|jpe?g|gif|webp|svg|ico|bmp|tiff?|avif|heic|'
     r'css|js|mjs|jsx|ts|tsx|map|'
@@ -462,7 +430,7 @@ _SKIP_EXT = re.compile(
     r'exe|dmg|msi|apk|deb|rpm|iso|img|bin|jar|class|'
     r'rss|atom|jsonl|ndjson|csv|tsv|yaml|yml|toml|ini|conf|cfg|'
     r'psd|ai|eps|sketch|fig|xd|'
-    r'torrent|magnet|wasm)(\?|#|$)',
+    r'torrent|magnet|wasm|webmanifest)(\?|#|$)',
     re.IGNORECASE,
 )
 
@@ -536,6 +504,8 @@ def normalize(url, base=''):
     netloc = p.netloc
     if not netloc or '.' not in netloc or len(netloc) > 253:
         return None
+    if _SKIP_HOSTS_RE.match(netloc):
+        return None
     path = p.path
     path_check = path if len(path) <= 100 else path[:60] + path[-40:]
     if '.' in path_check and _SKIP_EXT.search(path_check):
@@ -593,17 +563,16 @@ _NL_RE = re.compile(r'\n{3,}')
 _JUNK_RE = re.compile(r'[^\x20-\x7E\n\t]')
 _META_REFRESH_RE = re.compile(r'url\s*=\s*[\'"]?([^\'";]+)', re.IGNORECASE)
 
+# Focused link selector — no <img srcset>, no <source> (both are media we skip anyway)
 _LINK_SELECTOR = (
     'a[href], area[href], iframe[src], frame[src], '
-    'link[href], source[src], source[srcset], img[srcset], '
+    'link[href], '
     'meta[http-equiv="refresh"], meta[property="og:url"], '
-    'meta[name="twitter:url"], [data-href], [data-url], [data-link], '
+    'meta[name="twitter:url"], '
+    '[data-href], [data-url], [data-link], '
     '[data-src], [data-lazy-src], [data-original]'
 )
 
-_SRCSET_SPLIT_RE = re.compile(r'\s*,\s*')
-
-# Absolute-URL regex for scanning <script> payloads (Next.js / Nuxt / RSC / etc.)
 _SCRIPT_BLOCK_RE = re.compile(rb'<script\b[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
 _ABS_URL_RE = re.compile(
     rb'https?://[a-zA-Z0-9][a-zA-Z0-9\-._]{1,253}\.[a-zA-Z]{2,}'
@@ -611,12 +580,18 @@ _ABS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# JSON-LD url-bearing keys
 _JSONLD_RE = re.compile(
     rb'<script[^>]*type\s*=\s*["\']application/ld\+json["\'][^>]*>(.*?)</script>',
     re.IGNORECASE | re.DOTALL,
 )
 _JSONLD_KEYS = frozenset({'url', '@id', 'sameAs', 'href', 'link', 'permalink', 'canonicalUrl'})
+
+# RSS / Atom / sitemap
+_XML_URL_RE = re.compile(
+    rb'<(?:loc|link|url|id)[^>]*>\s*([^<\s]+)\s*</(?:loc|link|url|id)>',
+    re.IGNORECASE,
+)
+_XML_HREF_RE = re.compile(rb'<link[^>]*\bhref\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
 
 
 def _finalize_text(text):
@@ -626,34 +601,7 @@ def _finalize_text(text):
     return text.strip()
 
 
-def _maybe_srcset(val):
-    """Return first URL from a srcset or the value itself."""
-    if not val:
-        return None
-    if ',' in val:
-        best = None
-        best_w = -1.0
-        for part in _SRCSET_SPLIT_RE.split(val):
-            part = part.strip()
-            if not part:
-                continue
-            bits = part.split()
-            u = bits[0]
-            w = 1.0
-            if len(bits) > 1:
-                try:
-                    w = float(bits[1].rstrip('wx'))
-                except Exception:
-                    w = 1.0
-            if w > best_w:
-                best_w = w
-                best = u
-        return best
-    return val
-
-
 def _scan_scripts_for_urls(raw_bytes, base_url, limit):
-    """Bulk-extract absolute URLs from inside <script> blocks."""
     if b'<script' not in raw_bytes:
         return ()
     out = []
@@ -687,9 +635,9 @@ def _scan_jsonld_for_urls(raw_bytes, base_url, limit):
         except Exception:
             continue
         stack = [data]
-        depth = 0
-        while stack and depth < 200_000:
-            depth += 1
+        steps = 0
+        while stack and steps < 50_000:
+            steps += 1
             item = stack.pop()
             if isinstance(item, dict):
                 for k, v in item.items():
@@ -704,7 +652,7 @@ def _scan_jsonld_for_urls(raw_bytes, base_url, limit):
                     elif isinstance(v, (dict, list)):
                         stack.append(v)
             elif isinstance(item, list):
-                stack.extend(item[:1000])
+                stack.extend(item[:500])
     return tuple(out)
 
 
@@ -721,15 +669,6 @@ def _extract_links_selectolax(tree, base_url, limit):
             candidates.append(attrs.get('src'))
         elif tag == 'link':
             candidates.append(attrs.get('href'))
-        elif tag == 'source':
-            candidates.append(attrs.get('src'))
-            ss = attrs.get('srcset')
-            if ss:
-                candidates.append(_maybe_srcset(ss))
-        elif tag == 'img':
-            ss = attrs.get('srcset')
-            if ss:
-                candidates.append(_maybe_srcset(ss))
         elif tag == 'meta':
             he = (attrs.get('http-equiv') or '').lower()
             prop = (attrs.get('property') or attrs.get('name') or '').lower()
@@ -771,15 +710,6 @@ def _extract_links_lxml(doc, base_url, limit):
             candidates.append(node.get('src'))
         elif tag == 'link':
             candidates.append(node.get('href'))
-        elif tag == 'source':
-            candidates.append(node.get('src'))
-            ss = node.get('srcset')
-            if ss:
-                candidates.append(_maybe_srcset(ss))
-        elif tag == 'img':
-            ss = node.get('srcset')
-            if ss:
-                candidates.append(_maybe_srcset(ss))
         elif tag == 'meta':
             he = (node.get('http-equiv') or '').lower()
             prop = (node.get('property') or node.get('name') or '').lower()
@@ -971,8 +901,37 @@ def _parse_and_extract(raw, base_url):
     return _parse_lxml(raw, raw_bytes, base_url, cfg)
 
 
+def _parse_xml_links(raw_bytes, base_url, limit):
+    """RSS / Atom / sitemap: just harvest links."""
+    links = []
+    seen = set()
+    for m in _XML_URL_RE.finditer(raw_bytes):
+        try:
+            cand = m.group(1).decode('utf-8', 'ignore')
+        except Exception:
+            continue
+        n = normalize(cand, base_url)
+        if n and n not in seen:
+            seen.add(n)
+            links.append(n)
+            if len(links) >= limit:
+                return tuple(links)
+    for m in _XML_HREF_RE.finditer(raw_bytes):
+        try:
+            cand = m.group(1).decode('utf-8', 'ignore')
+        except Exception:
+            continue
+        n = normalize(cand, base_url)
+        if n and n not in seen:
+            seen.add(n)
+            links.append(n)
+            if len(links) >= limit:
+                return tuple(links)
+    return tuple(links)
+
+
 # ===========================================================================
-# Binary extraction — PyMuPDF first, pypdf fallback; native OCR rendering
+# Binary extraction (PyMuPDF first)
 # ===========================================================================
 
 def _pdf_extract_text(content_bytes):
@@ -1006,7 +965,6 @@ def _pdf_extract_text(content_bytes):
                     pass
         except Exception:
             return None
-    # pypdf / PyPDF2
     try:
         from io import BytesIO
         reader = _pdf_module.PdfReader(BytesIO(content_bytes))
@@ -1045,7 +1003,6 @@ def _image_ocr_pil(img):
 
 
 def _pdf_ocr(content_bytes):
-    """Render PDF pages directly with PyMuPDF — no pdf2image/poppler needed."""
     if _load_pdf() != 'pymupdf' or not _load_ocr():
         return None
     try:
@@ -1157,7 +1114,7 @@ def _prefill_bloom_from_output(bloom):
 
 
 # ===========================================================================
-# Challenge + retry-after + sitemap
+# Challenge detection + retry-after
 # ===========================================================================
 
 _CHALLENGE_MARKERS = (
@@ -1212,40 +1169,44 @@ _SITEMAP_LOC_RE = re.compile(r'<loc>\s*([^<\s]+)\s*</loc>', re.IGNORECASE)
 
 
 # ===========================================================================
-# Crawler — domain-scoped worker groups with dynamic lifecycle
+# Host state — queue, workers, event
+# ===========================================================================
+
+class HostState:
+    __slots__ = ('queue', 'workers', 'event', 'inflight',
+                 'last_active', 'challenge_count', 'blacklisted')
+
+    def __init__(self):
+        self.queue = deque()
+        self.workers = []
+        self.event = asyncio.Event()
+        self.inflight = 0
+        self.last_active = time.monotonic()
+        self.challenge_count = 0
+        self.blacklisted = False
+
+
+# ===========================================================================
+# Crawler
 # ===========================================================================
 
 class Crawler:
     __slots__ = (
-        'bloom', 'host_queues', 'host_workers', 'host_inflight',
-        'host_last_active', 'host_retire', 'active_hosts', 'dispatch_lock',
-        'pool', 'gate', 'rate_limiter',
+        'bloom', 'hosts', 'pool', 'rate_limiter', 'global_sem',
         'written', 'fetched', 'dropped', 'zero_link_pages', 'errors',
         'stop_flag', 'out_fd', 'stats_task', 'dispatcher_task',
         'start_time', 'last_report_time', 'last_report_written',
         'seed', 'seed_host', 'ocr_sem', 'challenges_total',
         'blacklisted_hosts', 'drop_log_count', 'drop_reasons',
-        'impersonate_errors',
+        'impersonate_errors', 'dispatcher_lock',
     )
 
     def __init__(self):
         self.bloom = BloomFilter(CONFIG['bloom_expected'], CONFIG['bloom_error'])
-        # Domain-scoped queues and worker groups
-        self.host_queues = {}          # host -> deque[(url, referer, depth)]
-        self.host_workers = {}         # host -> list[Task]
-        self.host_inflight = {}        # host -> int
-        self.host_last_active = {}     # host -> monotonic
-        self.host_retire = set()       # hosts marked for retirement
-        self.active_hosts = 0
-        self.dispatch_lock = asyncio.Lock()
-
+        self.hosts = {}
         self.pool = None
-        self.gate = AdaptiveGate(
-            CONFIG['max_active_hosts'] * CONFIG['workers_per_host'],
-            CONFIG['min_concurrency'],
-            CONFIG['max_concurrency'],
-        )
         self.rate_limiter = RateLimitTracker()
+        self.global_sem = None
 
         self.written = 0
         self.fetched = 0
@@ -1267,8 +1228,7 @@ class Crawler:
         self.drop_log_count = 0
         self.drop_reasons = {}
         self.impersonate_errors = 0
-
-    # ------------------------------------------------------------------ utils
+        self.dispatcher_lock = asyncio.Lock()
 
     def _log_drop(self, reason, url):
         self.dropped += 1
@@ -1281,11 +1241,12 @@ class Crawler:
         h = host_of(url)
         if not h:
             return False
-        q = self.host_queues.get(h)
-        if q is None:
-            q = deque()
-            self.host_queues[h] = q
-        q.append((url, referer, depth))
+        st = self.hosts.get(h)
+        if st is None:
+            st = HostState()
+            self.hosts[h] = st
+        st.queue.append((url, referer, depth))
+        st.event.set()
         return True
 
     def _enqueue_many(self, links, referer, depth):
@@ -1297,90 +1258,90 @@ class Crawler:
             bl.add(link)
             if self._enqueue(link, referer, depth):
                 added += 1
-                if len(self.host_queues) > 500_000:
-                    break
         return added
 
-    # ----------------------------------------------------- dispatcher / spawn
+    # ----------------------------------------------------------- dispatcher
 
     async def _dispatcher(self):
         interval = CONFIG['dispatch_interval']
         while not self.stop_flag:
-            async with self.dispatch_lock:
+            async with self.dispatcher_lock:
                 now = time.monotonic()
 
-                # Mark idle hosts for retirement
-                for host in list(self.host_workers.keys()):
-                    if host in self.host_retire:
-                        continue
-                    if self.host_inflight.get(host, 0) > 0:
-                        continue
-                    if self.host_queues.get(host):
-                        continue
-                    if now - self.host_last_active.get(host, now) > CONFIG['host_idle_timeout']:
-                        self.host_retire.add(host)
+                # 1. Prune finished workers from all host states
+                for host, st in list(self.hosts.items()):
+                    if st.workers:
+                        st.workers = [w for w in st.workers if not w.done()]
 
-                # Cleanup finished worker groups
-                for host in list(self.host_retire):
-                    workers = self.host_workers.get(host, [])
-                    alive = [w for w in workers if not w.done()]
-                    if not alive:
-                        self.host_workers.pop(host, None)
-                        self.host_retire.discard(host)
-                        self.active_hosts -= 1
-                    else:
-                        self.host_workers[host] = alive
+                # 2. Count active host groups
+                active = sum(1 for st in self.hosts.values() if st.workers)
 
-                # Spawn worker groups for hosts with pending work
-                for host, q in list(self.host_queues.items()):
-                    if not q or host in self.host_workers:
-                        continue
-                    if self.active_hosts >= CONFIG['max_active_hosts']:
-                        break
-                    self._spawn_host(host)
+                # 3. Spawn workers for hosts with queued work and no live workers
+                if active < CONFIG['max_active_hosts']:
+                    for host, st in self.hosts.items():
+                        if active >= CONFIG['max_active_hosts']:
+                            break
+                        if not st.queue:
+                            continue
+                        if st.workers:
+                            continue
+                        if st.blacklisted:
+                            continue
+                        if host in self.blacklisted_hosts:
+                            continue
+                        self._spawn_host(host, st)
+                        active += 1
 
             await asyncio.sleep(interval)
 
-    def _spawn_host(self, host):
-        n = CONFIG['workers_per_host']
-        workers = [asyncio.create_task(self._host_worker(host, i)) for i in range(n)]
-        self.host_workers[host] = workers
-        self.host_last_active[host] = time.monotonic()
-        self.active_hosts += 1
-        self.host_retire.discard(host)
+    def _spawn_host(self, host, st):
+        # Target worker count based on queue depth
+        target = min(
+            CONFIG['workers_per_host_max'],
+            max(CONFIG['workers_per_host_min'], len(st.queue) // 8),
+        )
+        st.workers = [
+            asyncio.create_task(self._host_worker(host, st, i))
+            for i in range(target)
+        ]
+        st.last_active = time.monotonic()
 
-    async def _host_worker(self, host, wid):
-        empty_streak = 0
-        while not self.stop_flag and host not in self.host_retire:
-            q = self.host_queues.get(host)
-            if not q:
-                empty_streak += 1
-                if empty_streak > 8:
+    async def _host_worker(self, host, st, wid):
+        while not self.stop_flag:
+            if st.blacklisted or host in self.blacklisted_hosts:
+                return
+            if not st.queue:
+                # Wait for new URLs or bail out after idle timeout
+                st.event.clear()
+                if st.queue:
+                    continue
+                try:
+                    await asyncio.wait_for(st.event.wait(), timeout=CONFIG['host_idle_timeout'])
+                except asyncio.TimeoutError:
                     return
-                await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    return
                 continue
-            empty_streak = 0
             try:
-                url, referer, depth = q.popleft()
+                url, referer, depth = st.queue.popleft()
             except IndexError:
                 continue
 
-            if self.rate_limiter.is_blacklisted(host):
-                self.blacklisted_hosts.add(host)
-                continue
-
-            self.host_inflight[host] = self.host_inflight.get(host, 0) + 1
+            st.inflight += 1
+            st.last_active = time.monotonic()
             try:
-                await self._process(url, referer, depth, host)
+                await self._process(url, referer, depth, host, st)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 self.errors += 1
                 if self.errors <= 20:
                     print(f'[w{host}:{wid}] {url[:80]}: {type(e).__name__}: {e}', file=sys.stderr)
             finally:
-                self.host_inflight[host] = self.host_inflight.get(host, 1) - 1
-                self.host_last_active[host] = time.monotonic()
+                st.inflight -= 1
+                st.last_active = time.monotonic()
 
-    # -------------------------------------------------------- standalone fetch
+    # --------------------------------------------------------- seed helpers
 
     async def _standalone_fetch(self, url, timeout=15):
         SessionCls = _load_session_cls()
@@ -1417,9 +1378,9 @@ class Crawler:
 
         seen_sitemaps = set()
         pages_added = 0
-        pending = deque(sitemap_urls[:CONFIG.get('sitemap_max_count', 50)])
-        max_sitemaps = CONFIG.get('sitemap_max_count', 50)
-        max_pages = CONFIG.get('sitemap_max_pages', 5000)
+        pending = deque(sitemap_urls[:CONFIG['sitemap_max_count']])
+        max_sitemaps = CONFIG['sitemap_max_count']
+        max_pages = CONFIG['sitemap_max_pages']
 
         while pending and len(seen_sitemaps) < max_sitemaps and pages_added < max_pages:
             sm_url = pending.popleft()
@@ -1446,7 +1407,7 @@ class Crawler:
                             break
         print(f'[sitemaps] {len(seen_sitemaps)} sitemaps, {pages_added} pages queued', file=sys.stderr)
 
-    # ------------------------------------------------------------- main loop
+    # -------------------------------------------------------------- main
 
     async def run(self, seed):
         self.seed = seed
@@ -1467,6 +1428,7 @@ class Crawler:
         self._enqueue(seed, '', 0)
 
         self.ocr_sem = asyncio.Semaphore(CONFIG['ocr_concurrency'])
+        self.global_sem = asyncio.Semaphore(CONFIG['max_concurrency'])
         self.pool = SessionPool(CONFIG['session_pool_size'], keys)
         await self.pool.start()
 
@@ -1483,10 +1445,10 @@ class Crawler:
         print(f'[Nexus] seed:        {seed}', file=sys.stderr)
         print(f'[Nexus] output:      {OUTPUT_FILE.resolve()}', file=sys.stderr)
         print(f'[Nexus] engine:      {engine}  parsers={CONFIG["parser_workers"]}', file=sys.stderr)
-        print(f'[Nexus] host groups: max={CONFIG["max_active_hosts"]}  workers/host={CONFIG["workers_per_host"]}  global_cap={CONFIG["max_concurrency"]}', file=sys.stderr)
+        print(f'[Nexus] hosts:       max={CONFIG["max_active_hosts"]}  workers/host={CONFIG["workers_per_host_min"]}-{CONFIG["workers_per_host_max"]}', file=sys.stderr)
+        print(f'[Nexus] global:      concurrency_cap={CONFIG["max_concurrency"]}', file=sys.stderr)
         print(f'[Nexus] sessions:    {CONFIG["session_pool_size"]}  impersonate={len(keys)}', file=sys.stderr)
         print(f'[Nexus] pdf:         {pdf_mode}   ocr: {"on" if ocr_ready else "off"}', file=sys.stderr)
-        print(f'[Nexus] max links:   {CONFIG["max_links_per_page"]}/page', file=sys.stderr)
 
         print('[Nexus] seeding sitemaps...', file=sys.stderr)
         try:
@@ -1511,9 +1473,8 @@ class Crawler:
                     await w
                 except Exception:
                     pass
-            # Cancel remaining host workers
-            for workers in list(self.host_workers.values()):
-                for w in workers:
+            for st in self.hosts.values():
+                for w in st.workers:
                     w.cancel()
             try:
                 if self.out_fd >= 0:
@@ -1544,13 +1505,15 @@ class Crawler:
             rate = dw / dt if dt > 0 else 0.0
             avg = self.written / (t - self.start_time) if t > self.start_time else 0.0
             err_pct = (self.dropped / self.fetched * 100.0) if self.fetched else 0.0
-            total_q = sum(len(q) for q in self.host_queues.values())
+            total_q = sum(len(st.queue) for st in self.hosts.values())
+            active = sum(1 for st in self.hosts.values() if st.workers)
+            total_workers = sum(len(st.workers) for st in self.hosts.values())
             print(
                 f'[s] {rate:6.1f}/s avg {avg:6.1f}/s  '
                 f'w={self.written} f={self.fetched} d={self.dropped}({err_pct:.0f}%)  '
-                f'q={total_q} hosts={self.active_hosts}/{len(self.host_queues)}  '
-                f'g={self.gate.current} zl={self.zero_link_pages}  '
-                f'ch={self.challenges_total} im={self.impersonate_errors} bl={len(self.blacklisted_hosts)}',
+                f'q={total_q} hosts={active}/{len(self.hosts)} wrk={total_workers}  '
+                f'zl={self.zero_link_pages} ch={self.challenges_total} '
+                f'im={self.impersonate_errors} bl={len(self.blacklisted_hosts)}',
                 file=sys.stderr,
             )
             self.last_report_time = t
@@ -1564,7 +1527,7 @@ class Crawler:
             f'dropped={self.dropped}  errors={self.errors}  '
             f'zerolink={self.zero_link_pages}  challenges={self.challenges_total}  '
             f'imp-errors={self.impersonate_errors}  '
-            f'hosts_seen={len(self.host_queues)}  '
+            f'hosts_seen={len(self.hosts)}  '
             f'elapsed={elapsed:.1f}s  avg={avg:.1f}/s',
             file=sys.stderr,
         )
@@ -1574,19 +1537,23 @@ class Crawler:
             top = sorted(self.drop_reasons.items(), key=lambda x: -x[1])[:10]
             print('[drops] ' + '  '.join(f'{r}={c}' for r, c in top), file=sys.stderr)
 
-    # ---------------------------------------------------------------- process
+    # --------------------------------------------------------- the pipeline
 
-    async def _process(self, url, referer, depth, host):
+    async def _process(self, url, referer, depth, host, st):
         self.fetched += 1
         status = 0
         retry_after = 0.0
+
+        # Rate-limit sleep FIRST, outside of any gate — sleeping workers
+        # don't hold network slots.
         await self.rate_limiter.wait(host)
-        await self.gate.acquire()
+
         try:
             resp = None
             body_bytes = b''
             raw = None
             resp_headers = {}
+            idx = -1
 
             for _ in range(CONFIG['impersonate_retry_limit'] + 1):
                 idx = self.pool.pick()
@@ -1597,13 +1564,15 @@ class Crawler:
                     continue
                 headers = build_headers(referer, host)
                 try:
-                    resp = await sess.get(
-                        url,
-                        headers=headers,
-                        timeout=CONFIG['request_timeout'],
-                        allow_redirects=True,
-                        max_redirects=CONFIG['max_redirects'],
-                    )
+                    # Global semaphore held ONLY during the actual network call.
+                    async with self.global_sem:
+                        resp = await sess.get(
+                            url,
+                            headers=headers,
+                            timeout=CONFIG['request_timeout'],
+                            allow_redirects=True,
+                            max_redirects=CONFIG['max_redirects'],
+                        )
                     status = resp.status_code
                     try:
                         body_bytes = resp.content or b''
@@ -1650,8 +1619,13 @@ class Crawler:
 
             ctype = (resp_headers.get('content-type') or resp_headers.get('Content-Type') or '').lower()
 
+            # Challenge detection — count per host, blacklist at threshold
             if _is_challenge(body_bytes, status, resp_headers):
                 self.challenges_total += 1
+                st.challenge_count += 1
+                if st.challenge_count >= CONFIG['host_challenge_blacklist_threshold']:
+                    st.blacklisted = True
+                    self.blacklisted_hosts.add(host)
                 self._log_drop(f'challenge-{status}', url)
                 return
 
@@ -1670,6 +1644,8 @@ class Crawler:
                 content_type = 'pdf'
             elif ctype.startswith('image/'):
                 content_type = 'image'
+            elif ('xml' in ctype or 'rss' in ctype or 'atom' in ctype):
+                content_type = 'xml'
             else:
                 self._log_drop(f'ctype-{ctype[:30]}', url)
                 return
@@ -1689,6 +1665,18 @@ class Crawler:
                 except Exception as e:
                     self._log_drop(f'parse-{type(e).__name__}', url)
                     return
+            elif content_type == 'xml':
+                if not body_bytes:
+                    self._log_drop('empty-xml', url)
+                    return
+                try:
+                    links = await loop.run_in_executor(
+                        PARSER_POOL, _parse_xml_links, body_bytes, url, CONFIG['max_links_per_page']
+                    )
+                except Exception as e:
+                    self._log_drop(f'xml-{type(e).__name__}', url)
+                    return
+                cleaned = None
             else:
                 if not body_bytes:
                     self._log_drop('empty-binary', url)
@@ -1728,7 +1716,6 @@ class Crawler:
             else:
                 self._enqueue_many(links, url, depth + 1)
         finally:
-            await self.gate.release(status or 599)
             await self.rate_limiter.record(host, status, retry_after)
 
 
