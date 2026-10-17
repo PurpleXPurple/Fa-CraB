@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import hashlib
 import heapq
 import json
 import logging
 import math
+import mmap
 import os
 import random
 import re
 import signal
 import time
-import unicodedata
 import zipfile
 from collections import Counter, OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Optional
@@ -40,16 +42,23 @@ from selectolax.lexbor import LexborHTMLParser
 
 log = logging.getLogger("scraper")
 
-_Timeout = getattr(curl_exc, "Timeout", asyncio.TimeoutError)
-_ProxyError = getattr(curl_exc, "ProxyError", type("_NeverProxy", (Exception,), {}))
 _ImpersonateError = getattr(curl_exc, "ImpersonateError", type("_NeverImpersonate", (Exception,), {}))
 _CurlRequestError = curl_exc.RequestException
 
-BLOCK_STATUS = {401, 403, 407, 429, 451, 503}
+try:
+    _libc = ctypes.CDLL(None)
+    _memmove = _libc.memmove
+    _memmove.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    _memmove.restype = ctypes.c_void_p
+except Exception:
+    _libc = None
+    _memmove = None
+
+BLOCK_STATUS = {403, 407, 451, 503}
 CHALLENGE_MARKERS = (
-    b"just a moment", b"cf-chl", b"attention required", b"access denied",
-    b"enable javascript and cookies", b"px-captcha", b"checking your browser",
-    b"verify you are human", b"request blocked",
+    b"captcha-delivery.com", b"px-captcha", b"cf_chl_opt",
+    b"/cdn-cgi/challenge-platform/", b"just a moment",
+    b"attention required", b"verify you are human", b"enable javascript and cookies",
 )
 SKIP_EXT = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tiff",
@@ -83,45 +92,14 @@ STOP = set(
 )
 CONTENT_TYPES = ("text/html", "application/xhtml", "text/plain")
 
-PROFILES = (
-    {
-        "impersonate": "chrome",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"Windows"',
-    },
-    {
-        "impersonate": "chrome131",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-        "platform": '"macOS"',
-    },
-    {
-        "impersonate": "safari",
-        "ua": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-        "ch_ua": '"Safari";v="18", "Not_A Brand";v="99"',
-        "platform": '"macOS"',
-    },
-    {
-        "impersonate": "firefox",
-        "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "ch_ua": '"Firefox";v="133", "Not_A Brand";v="99"',
-        "platform": '"Windows"',
-    },
-)
-REFERERS = (
-    "https://www.google.com/",
-    "https://www.bing.com/",
-    "https://duckduckgo.com/",
-    "https://news.ycombinator.com/",
-    "https://www.reddit.com/",
-)
-LANGUAGES = (
-    "en-US,en;q=0.9",
-    "en-GB,en;q=0.8",
-    "en-US,en;q=0.9,fr;q=0.6",
-    "en-US,en;q=0.9,de;q=0.5",
-)
+_DROP_SELECTOR = ",".join(DROP_TAGS)
+_BOILER_SELECTOR = ",".join(f'[class*="{p}"],[id*="{p}"]' for p in BOILERPLATE_PATTERNS)
+_JS_RE = re.compile(r"\b(function|var|let|const)\s*[\(=]|\bdocument\.|\bwindow\.|=>\s*\{|addEventListener")
+_SENT_RE = re.compile(r"(?<=[.!?。！？])\s+")
+_TOKEN_RE = re.compile(r"[A-Za-z\u00C0-\u024F']+")
+_WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]{2,}")
+_ZW_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
+_WS_RE = re.compile(r"\s+")
 
 
 @dataclass
@@ -129,33 +107,36 @@ class Config:
     seed: str = ""
     output_dir: Path = Path("data")
     session_zip: Path = Path("session.zip")
-    chunk_bytes: int = 20 * 1024 * 1024
-    max_body_bytes: int = 8 * 1024 * 1024
+    chunk_mb: float = 20.0
     max_text_chars: int = 2_000_000
-    max_links_per_page: int = 300
-    workers: int = 400
-    concurrency: int = 300
-    min_concurrency: int = 32
-    max_concurrency: int = 600
-    per_domain_concurrency: int = 8
-    per_domain_rps: float = 12.0
-    per_domain_burst: float = 24.0
+    max_links_per_page: int = 80
+    workers: int = 120
+    concurrency: int = 120
+    per_domain_concurrency: int = 4
+    per_domain_rps: float = 5.0
+    per_domain_burst: float = 8.0
     timeout: float = 12.0
-    retries: int = 2
+    retries: int = 1
     max_depth: int = 6
     max_pages: int = 0
-    max_queue: int = 500_000
-    max_domains: int = 50_000
-    bloom_capacity: int = 2_000_000
+    max_queue: int = 200_000
+    max_domains: int = 20_000
+    bloom_capacity: int = 1_000_000
     bloom_error: float = 0.01
-    simhash_items: int = 30_000
-    failure_cooldown: float = 30.0
-    protect_after: int = 6
+    simhash_items: int = 20_000
+    protect_after: int = 3
+    rate_limit_cooldown: float = 60.0
     stats_interval: float = 5.0
     log_level: str = "INFO"
     proxies: list[str] = field(default_factory=list)
     http_version: str = ""
     resume: bool = True
+    impersonate_targets: list[str] = field(default_factory=lambda: ["chrome136", "safari184", "firefox133", "chrome"])
+    parse_threads: int = 16
+
+    @property
+    def chunk_bytes(self) -> int:
+        return int(self.chunk_mb * 1024 * 1024)
 
     @classmethod
     def load(cls) -> "Config":
@@ -166,18 +147,13 @@ class Config:
         parser.add_argument("--session")
         parser.add_argument("--workers", type=int)
         parser.add_argument("--concurrency", type=int)
-        parser.add_argument("--min-concurrency", type=int)
-        parser.add_argument("--max-concurrency", type=int)
         parser.add_argument("--per-domain-concurrency", type=int)
         parser.add_argument("--per-domain-rps", type=float)
-        parser.add_argument("--per-domain-burst", type=float)
         parser.add_argument("--timeout", type=float)
-        parser.add_argument("--retries", type=int)
         parser.add_argument("--max-depth", type=int)
         parser.add_argument("--max-pages", type=int)
         parser.add_argument("--chunk-mb", type=float)
         parser.add_argument("--stats-interval", type=float)
-        parser.add_argument("--bloom-capacity", type=int)
         parser.add_argument("--proxy", action="append")
         parser.add_argument("--http-version")
         parser.add_argument("--log-level")
@@ -200,12 +176,10 @@ class Config:
         overrides = {
             "seed": args.seed, "output_dir": args.output, "session_zip": args.session,
             "workers": args.workers, "concurrency": args.concurrency,
-            "min_concurrency": args.min_concurrency, "max_concurrency": args.max_concurrency,
             "per_domain_concurrency": args.per_domain_concurrency,
-            "per_domain_rps": args.per_domain_rps, "per_domain_burst": args.per_domain_burst,
-            "timeout": args.timeout, "retries": args.retries, "max_depth": args.max_depth,
-            "max_pages": args.max_pages, "stats_interval": args.stats_interval,
-            "bloom_capacity": args.bloom_capacity, "log_level": args.log_level,
+            "per_domain_rps": args.per_domain_rps, "timeout": args.timeout,
+            "max_depth": args.max_depth, "max_pages": args.max_pages,
+            "stats_interval": args.stats_interval, "log_level": args.log_level,
             "http_version": args.http_version,
         }
         for name, value in overrides.items():
@@ -215,14 +189,13 @@ class Config:
                 else:
                     setattr(cfg, name, value)
         if args.chunk_mb is not None:
-            cfg.chunk_bytes = int(args.chunk_mb * 1024 * 1024)
+            cfg.chunk_mb = args.chunk_mb
         if args.proxy:
             cfg.proxies = args.proxy
         if args.no_resume:
             cfg.resume = False
 
         cfg.workers = max(cfg.workers, cfg.concurrency)
-        cfg.concurrency = max(cfg.min_concurrency, min(cfg.concurrency, cfg.max_concurrency))
         return cfg
 
 
@@ -248,13 +221,26 @@ class Stats:
     rejected: int = 0
     dedup: int = 0
     bytes_in: int = 0
+    bytes_written: int = 0
+    records: int = 0
+    fetch_ms: float = 0.0
+    parse_ms: float = 0.0
     started: float = field(default_factory=time.monotonic)
+    block_reasons: Counter = field(default_factory=Counter)
+    quality_reasons: Counter = field(default_factory=Counter)
 
-    def processed(self) -> int:
+    def pages(self) -> int:
         return self.ok + self.blocked + self.failed + self.rejected
 
     def rate(self) -> float:
-        return self.processed() / max(1e-9, time.monotonic() - self.started)
+        return self.pages() / max(1e-9, time.monotonic() - self.started)
+
+    def avg_fetch(self) -> float:
+        n = max(1, self.pages())
+        return self.fetch_ms / n
+
+    def avg_parse(self) -> float:
+        return self.parse_ms / max(1, self.ok + self.rejected)
 
 
 class BloomFilter:
@@ -302,43 +288,10 @@ class TokenBucket:
             await asyncio.sleep(wait)
 
 
-class AdaptiveLimiter:
-    def __init__(self, initial: int, minimum: int, maximum: int) -> None:
-        self.limit = max(minimum, min(initial, maximum))
-        self.minimum = minimum
-        self.maximum = maximum
-        self.active = 0
-        self.successes = 0
-        self.waiters: list[asyncio.Event] = []
-
-    async def acquire(self) -> None:
-        while True:
-            if self.active < self.limit:
-                self.active += 1
-                return
-            event = asyncio.Event()
-            self.waiters.append(event)
-            await event.wait()
-
-    def release(self, healthy: bool) -> None:
-        self.active = max(0, self.active - 1)
-        if healthy:
-            self.successes += 1
-            if self.successes >= 64 and self.limit < self.maximum:
-                self.limit += 1
-                self.successes = 0
-        else:
-            self.limit = max(self.minimum, self.limit // 2)
-            self.successes = 0
-        if self.waiters and self.active < self.limit:
-            self.waiters.pop(0).set()
-
-
 @dataclass
 class DomainState:
     sem: asyncio.Semaphore
     bucket: TokenBucket
-    failures: int = 0
     consecutive: int = 0
     protected: bool = False
     cooldown_until: float = 0.0
@@ -380,18 +333,20 @@ class DomainRegistry:
     def mark_blocked(self, domain: str) -> None:
         self.get(domain).protected = True
 
+    def mark_rate_limited(self, domain: str) -> None:
+        self.get(domain).cooldown_until = time.monotonic() + self.cfg.rate_limit_cooldown
+
     def mark_failure(self, domain: str) -> None:
         state = self.get(domain)
-        state.failures += 1
         state.consecutive += 1
-        if state.consecutive >= 3:
-            state.cooldown_until = time.monotonic() + min(300.0, self.cfg.failure_cooldown * (2 ** (state.consecutive - 3)))
-        if state.failures >= self.cfg.protect_after:
+        if state.consecutive >= self.cfg.protect_after:
             state.protected = True
 
     def mark_success(self, domain: str) -> None:
-        state = self.get(domain)
-        state.consecutive = 0
+        self.get(domain).consecutive = 0
+
+    def protected_count(self) -> int:
+        return sum(1 for state in self._states.values() if state.protected)
 
     def size(self) -> int:
         return len(self._states)
@@ -406,33 +361,23 @@ class DomainRegistry:
                 continue
 
 
-class SpoofEngine:
-    def profile(self) -> dict:
-        return random.choice(PROFILES)
-
-    def headers(self, profile: dict) -> dict:
-        pairs = [
-            ("User-Agent", profile["ua"]),
-            ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
-            ("Accept-Language", random.choice(LANGUAGES)),
-            ("Accept-Encoding", "gzip, deflate, br"),
-            ("Sec-CH-UA", profile["ch_ua"]),
-            ("Sec-CH-UA-Platform", profile["platform"]),
-            ("Sec-CH-UA-Mobile", "?0"),
-            ("Sec-Fetch-Site", random.choice(("none", "same-origin", "cross-site"))),
-            ("Sec-Fetch-Mode", "navigate"),
-            ("Sec-Fetch-Dest", "document"),
-            ("Sec-Fetch-User", "?1"),
-            ("Upgrade-Insecure-Requests", "1"),
-            ("Referer", random.choice(REFERERS)),
-            ("Cache-Control", random.choice(("no-cache", "max-age=0"))),
-            ("DNT", "1"),
-        ]
-        random.shuffle(pairs)
-        return dict(pairs)
-
-    def jitter(self, attempt: int) -> float:
-        return min(1.5, random.uniform(0.01, 0.08) * (2 ** attempt))
+class BlockClassifier:
+    def classify(self, status: int, headers: dict, body: bytes) -> tuple[bool, str]:
+        lower = {k.lower(): v for k, v in headers.items()}
+        sample = body[:16384].lower() if body else b""
+        if b"captcha-delivery.com" in sample:
+            return True, "datadome"
+        if b"px-captcha" in sample:
+            return True, "perimeterx"
+        if lower.get("cf-mitigated") == "challenge" or b"cf_chl_opt" in sample or b"/cdn-cgi/challenge-platform/" in sample:
+            return True, "cloudflare_challenge"
+        if status in BLOCK_STATUS:
+            return True, f"http_{status}"
+        if status == 429:
+            return True, "rate_limit"
+        if any(marker in sample for marker in CHALLENGE_MARKERS):
+            return True, "challenge_body"
+        return False, ""
 
 
 class ProxyPool:
@@ -461,8 +406,8 @@ class FetchResult:
     content: Optional[bytes]
     status: int
     headers: dict
-    content_type: str = ""
     blocked: bool = False
+    reason: str = ""
     error: str = ""
     elapsed_ms: float = 0.0
 
@@ -493,6 +438,7 @@ class PageParser:
         title = (title or "")[:300]
 
         links: list[str] = []
+        seen: set[str] = set()
         link_chars = 0
         for anchor in tree.css("a[href]"):
             href = anchor.attributes.get("href")
@@ -502,50 +448,48 @@ class PageParser:
             if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
                 continue
             absolute = urljoin(base_url, href)
+            if absolute in seen:
+                continue
+            seen.add(absolute)
             links.append(absolute)
             link_chars += len(anchor.text(strip=True))
             if len(links) >= self.cfg.max_links_per_page:
                 break
 
-        for tag in DROP_TAGS:
-            for node in tree.css(tag):
-                try:
-                    node.decompose()
-                except Exception:
-                    pass
+        for node in tree.css(_DROP_SELECTOR):
+            try:
+                node.decompose()
+            except Exception:
+                pass
 
-        for pattern in BOILERPLATE_PATTERNS:
-            selector = f'[class*="{pattern}"],[id*="{pattern}"]'
-            for node in tree.css(selector):
-                try:
-                    node.decompose()
-                except Exception:
-                    pass
+        for node in tree.css(_BOILER_SELECTOR):
+            try:
+                node.decompose()
+            except Exception:
+                pass
 
         body = tree.body or tree.root
         raw = body.text(separator=" ", strip=True) if body else ""
-        text = clean_text(raw)[: self.cfg.max_text_chars]
+        text = _clean_text(raw)[: self.cfg.max_text_chars]
         return PageData(title=title, text=text, links=links, link_chars=link_chars, html_len=len(html))
 
 
-def clean_text(text: str) -> str:
-    text = unicodedata.normalize("NFC", text)
-    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+def _clean_text(text: str) -> str:
+    if _ZW_RE.search(text):
+        text = _ZW_RE.sub("", text)
+    return _WS_RE.sub(" ", text).strip()
 
 
-def simhash64(text: str) -> int:
-    tokens = re.findall(r"[a-z0-9']+", text.lower())[:2000]
+def _simhash32(text: str) -> int:
+    tokens = _TOKEN_RE.findall(text[:6000].lower())
     if not tokens:
         return 0
-    unique = list(dict.fromkeys(tokens))[:300]
-    votes = [0] * 64
-    for token in unique:
-        value = int.from_bytes(hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest(), "big")
-        for bit in range(64):
-            votes[bit] += 1 if (value >> bit) & 1 else -1
-    return sum(1 << bit for bit in range(64) if votes[bit] > 0)
+    votes = [0] * 32
+    for token in set(tokens):
+        h = hash(token) & 0xFFFFFFFF
+        for bit in range(32):
+            votes[bit] += 1 if (h >> bit) & 1 else -1
+    return sum(1 << bit for bit in range(32) if votes[bit] > 0)
 
 
 class SimHashIndex:
@@ -555,16 +499,16 @@ class SimHashIndex:
         self.order: deque[int] = deque()
         self.bands: list[dict[int, list[int]]] = [dict() for _ in range(4)]
 
-    def add_if_unique(self, fingerprint: int, distance: int = 3) -> bool:
+    def add_if_unique(self, fingerprint: int, distance: int = 2) -> bool:
         for band in range(4):
-            key = (fingerprint >> (band * 16)) & 0xFFFF
+            key = (fingerprint >> (band * 8)) & 0xFF
             for other in self.bands[band].get(key, ()):
                 if other in self.alive and (fingerprint ^ other).bit_count() <= distance:
                     return False
         self.alive.add(fingerprint)
         self.order.append(fingerprint)
         for band in range(4):
-            key = (fingerprint >> (band * 16)) & 0xFFFF
+            key = (fingerprint >> (band * 8)) & 0xFF
             self.bands[band].setdefault(key, []).append(fingerprint)
         if len(self.order) >= self.maximum * 2:
             self._rebuild()
@@ -576,7 +520,7 @@ class SimHashIndex:
         self.bands = [dict() for _ in range(4)]
         for fingerprint in keep:
             for band in range(4):
-                key = (fingerprint >> (band * 16)) & 0xFFFF
+                key = (fingerprint >> (band * 8)) & 0xFF
                 self.bands[band].setdefault(key, []).append(fingerprint)
         self.order = deque(keep)
 
@@ -585,76 +529,57 @@ class QualityGate:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.simhash = SimHashIndex(cfg.simhash_items)
-        self.reasons: Counter = Counter()
 
-    def accept(self, page: PageData) -> bool:
+    def accept(self, page: PageData) -> tuple[bool, str]:
         ok, reason = self._layer_one(page)
         if not ok:
-            self.reasons[reason] += 1
-            return False
+            return False, reason
         ok, reason = self._layer_two(page)
         if not ok:
-            self.reasons[reason] += 1
-            return False
-        fingerprint = simhash64(page.text)
-        if not self.simhash.add_if_unique(fingerprint):
-            self.reasons["near_duplicate"] += 1
-            return False
-        return True
-
-    def _layer_one(self, page: PageData):
-        text = page.text
-        size = len(text)
-        if size < 250:
-            return False, "too_short"
-        if size > self.cfg.max_text_chars:
-            return False, "too_long"
-        sample = text[:12000]
-        alnum = sum(1 for char in sample if char.isalnum())
-        if alnum / max(1, len(sample)) < 0.30:
-            return False, "low_alnum"
-        words = re.findall(r"[A-Za-z\u00C0-\u024F]{2,}", sample)
-        if len(words) < 40:
-            return False, "few_words"
-        if len({word.lower() for word in words}) / len(words) < 0.15:
-            return False, "low_unique"
-        if re.search(r"\b(function|var|let|const)\s*[\(=]|\bdocument\.|\bwindow\.|=>\s*\{|addEventListener", sample):
-            return False, "js_residue"
-        if sample.count("<") > 5 or sample.count("{") > 20:
-            return False, "html_residue"
-        digits = sum(1 for char in sample if char.isdigit())
-        if digits / max(1, len(sample)) > 0.35:
-            return False, "digit_heavy"
-        letters = sum(1 for char in sample if char.isalpha())
-        upper = sum(1 for char in sample if char.isupper())
-        if letters and upper / letters > 0.45:
-            return False, "upper_heavy"
+            return False, reason
+        if not self.simhash.add_if_unique(_simhash32(page.text)):
+            return False, "near_duplicate"
         return True, ""
 
-    def _layer_two(self, page: PageData):
+    def _layer_one(self, page: PageData) -> tuple[bool, str]:
         text = page.text
-        sentences = [part for part in re.split(r"(?<=[.!?。！？])\s+", text) if len(part.strip()) > 10]
+        n = len(text)
+        if n < 300:
+            return False, "too_short"
+        sample = text[:10000]
+        alnum = sum(1 for c in sample if c.isalnum())
+        if alnum / len(sample) < 0.32:
+            return False, "low_alnum"
+        if _JS_RE.search(sample):
+            return False, "js_residue"
+        if sample.count("<") > 5 or sample.count("{") > 15:
+            return False, "html_residue"
+        words = _WORD_RE.findall(sample)
+        if len(words) < 50:
+            return False, "few_words"
+        if len({w.lower() for w in words}) / len(words) < 0.16:
+            return False, "low_unique"
+        return True, ""
+
+    def _layer_two(self, page: PageData) -> tuple[bool, str]:
+        text = page.text
+        sentences = [s for s in _SENT_RE.split(text) if len(s) > 10]
         if len(sentences) < 3:
             return False, "few_sentences"
-        lengths = [len(sentence) for sentence in sentences]
-        average = sum(lengths) / len(lengths)
-        if not 20 <= average <= 400:
+        lengths = [len(s) for s in sentences]
+        avg = sum(lengths) / len(lengths)
+        if not 25 <= avg <= 350:
             return False, "sentence_length"
-        if max(lengths) > 4000:
-            return False, "long_sentence"
-        tokens = re.findall(r"[A-Za-z\u00C0-\u024F']+", text.lower())
+        tokens = _TOKEN_RE.findall(text.lower())
         if not tokens:
             return False, "no_tokens"
-        stop_ratio = sum(1 for token in tokens if token in STOP) / len(tokens)
-        if not 0.05 <= stop_ratio <= 0.50:
+        stop_ratio = sum(1 for t in tokens if t in STOP) / len(tokens)
+        if not 0.06 <= stop_ratio <= 0.45:
             return False, "stop_ratio"
-        if page.link_chars / max(1, len(text)) > 0.20:
+        if page.link_chars / max(1, len(text)) > 0.25:
             return False, "link_density"
-        if page.html_len and len(text) / page.html_len < 0.015:
+        if page.html_len and len(text) / page.html_len < 0.02:
             return False, "text_html_ratio"
-        grams = [" ".join(tokens[index:index + 5]) for index in range(0, min(len(tokens) - 5, 2000))]
-        if grams and 1 - len(set(grams)) / len(grams) > 0.35:
-            return False, "repetition"
         return True, ""
 
 
@@ -717,31 +642,36 @@ class Frontier:
             score += 2
         state = self.registry.peek(self._domain(url))
         if state:
-            score += min(state.failures * 4, 40)
+            score += min(state.consecutive * 4, 40)
         return score
 
-    async def push(self, url: str, depth: int) -> bool:
+    async def push_many(self, urls: list[str], depth: int) -> int:
         if self.closed:
-            return False
-        normalized = self._normalize(url)
-        if not normalized:
-            return False
-        domain = self._domain(normalized)
-        if not self.registry.admit(domain):
-            return False
-        if len(self.heap) >= self.cfg.max_queue:
-            return False
-        if not self.bloom.add(normalized.encode("utf-8")):
-            self.stats.dedup += 1
-            return False
-        priority = self._priority(normalized, depth)
+            return 0
+        prepared: list[tuple[int, str, int]] = []
+        for url in urls:
+            normalized = self._normalize(url)
+            if not normalized:
+                continue
+            domain = self._domain(normalized)
+            if not self.registry.admit(domain):
+                continue
+            if not self.bloom.add(normalized.encode("utf-8")):
+                self.stats.dedup += 1
+                continue
+            prepared.append((self._priority(normalized, depth), normalized, depth))
+        if not prepared:
+            return 0
         async with self.condition:
-            self.outstanding += 1
-            self.sequence += 1
-            heapq.heappush(self.heap, (priority, self.sequence, normalized, depth))
-            self.tail.append(normalized)
-            self.condition.notify()
-        return True
+            for priority, normalized, d in prepared:
+                if len(self.heap) >= self.cfg.max_queue:
+                    break
+                self.outstanding += 1
+                self.sequence += 1
+                heapq.heappush(self.heap, (priority, self.sequence, normalized, d))
+                self.tail.append(normalized)
+            self.condition.notify_all()
+        return len(prepared)
 
     async def pop(self) -> Optional[tuple[int, int, str, int]]:
         async with self.condition:
@@ -773,48 +703,111 @@ class Frontier:
         return len(self.heap)
 
 
-class ChunkWriter:
+class MMapChunkWriter:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.output = cfg.output_dir
-        self.output.mkdir(parents=True, exist_ok=True)
-        for stale in self.output.glob("*.tmp"):
+        self.capacity = cfg.chunk_bytes
+        self.dir = cfg.output_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for stale in self.dir.glob("*.tmp"):
             try:
                 stale.unlink()
             except OSError:
                 pass
-        self.buffer: list[dict] = []
-        self.buffer_bytes = 0
         self.index = 0
         self.records = 0
+        self.bytes_written = 0
+        self._fd = -1
+        self._mm: Optional[mmap.mmap] = None
+        self._path: Optional[Path] = None
+        self._offset = 0
+        self._count = 0
+        self._open()
+
+    def _open(self) -> None:
+        path = self.dir / f"chunk_{self.index:05d}.json"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+        os.ftruncate(fd, self.capacity)
+        mm = mmap.mmap(fd, self.capacity, access=mmap.ACCESS_WRITE)
+        try:
+            if _libc is not None and hasattr(_libc, "madvise"):
+                _libc.madvise(ctypes.c_void_p.from_buffer(mm), self.capacity, 2)
+        except Exception:
+            pass
+        self._fd = fd
+        self._mm = mm
+        self._path = path
+        self._offset = 0
+        self._count = 0
+        self._write(b"[")
+
+    def _write(self, data: bytes) -> None:
+        n = len(data)
+        if self._offset + n > self.capacity:
+            raise BufferError("chunk overflow")
+        if _memmove is not None and self._mm is not None:
+            dest = ctypes.addressof(ctypes.c_char.from_buffer(self._mm, self._offset))
+            _memmove(dest, data, n)
+        elif self._mm is not None:
+            self._mm[self._offset:self._offset + n] = data
+        else:
+            raise RuntimeError("writer not open")
+        self._offset += n
 
     def add(self, title: str, text: str) -> None:
-        record = {"title": title[:500], "text": text}
-        size = len(_dumps(record))
-        if self.buffer and self.buffer_bytes + size > self.cfg.chunk_bytes:
-            self.flush()
-        self.buffer.append(record)
-        self.buffer_bytes += size
+        record = {"title": title[:300], "text": text}
+        blob = _dumps(record)
+        sep = b"," if self._count else b""
+        needed = len(sep) + len(blob) + 1
+        if self._offset + needed > self.capacity:
+            self._finalize()
+            self._open()
+            sep = b""
+            needed = len(blob) + 1
+            if self._offset + needed > self.capacity:
+                return
+        self._write(sep)
+        self._write(blob)
+        self._count += 1
         self.records += 1
+        self.bytes_written += len(sep) + len(blob)
 
-    def flush(self) -> None:
-        if not self.buffer:
+    def _finalize(self) -> None:
+        if self._mm is None or self._offset <= 1:
+            self._close_empty()
             return
-        target = self.output / f"chunk_{self.index:05d}.json"
-        temporary = target.with_suffix(".tmp")
-        temporary.write_bytes(_dumps(self.buffer))
-        os.replace(temporary, target)
-        self.buffer.clear()
-        self.buffer_bytes = 0
+        self._write(b"]")
+        self._mm.flush()
+        os.ftruncate(self._fd, self._offset)
+        self._mm.close()
+        os.close(self._fd)
+        self._mm = None
+        self._fd = -1
         self.index += 1
+
+    def _close_empty(self) -> None:
+        if self._mm is not None:
+            self._mm.close()
+        if self._fd >= 0:
+            os.close(self._fd)
+        if self._path is not None:
+            try:
+                self._path.unlink()
+            except OSError:
+                pass
+        self._mm = None
+        self._fd = -1
+
+    def close(self) -> None:
+        self._finalize()
 
 
 class Fetcher:
-    def __init__(self, cfg: Config, spoof: SpoofEngine) -> None:
+    def __init__(self, cfg: Config, classifier: BlockClassifier) -> None:
         self.cfg = cfg
-        self.spoof = spoof
-        self.session = AsyncSession(max_clients=cfg.max_concurrency)
-        self.limiter = AdaptiveLimiter(cfg.concurrency, cfg.min_concurrency, cfg.max_concurrency)
+        self.classifier = classifier
+        self.session = AsyncSession(max_clients=cfg.concurrency, default_headers=True)
+        self.targets = list(cfg.impersonate_targets)
         self.proxies = ProxyPool(cfg.proxies)
 
     async def close(self) -> None:
@@ -823,96 +816,57 @@ class Fetcher:
         except Exception:
             pass
 
-    def _is_blocked(self, status: int, body: bytes) -> bool:
-        if status in BLOCK_STATUS:
-            return True
-        if len(body) > 30000:
-            return False
-        sample = body[:8192].lower()
-        return any(marker in sample for marker in CHALLENGE_MARKERS)
-
     async def fetch(self, url: str, state: DomainState) -> FetchResult:
         await state.bucket.acquire()
         async with state.sem:
             state.active += 1
-            limiter_acquired = False
-            healthy = False
             started = time.monotonic()
+            target = random.choice(self.targets)
+            proxy = self.proxies.next()
+            kwargs = {
+                "impersonate": target,
+                "timeout": self.cfg.timeout,
+                "allow_redirects": True,
+                "max_redirects": 5,
+                "default_headers": True,
+            }
+            if proxy:
+                kwargs["proxies"] = {"http": proxy, "https": proxy}
+            if self.cfg.http_version:
+                kwargs["http_version"] = self.cfg.http_version
             try:
-                await self.limiter.acquire()
-                limiter_acquired = True
-                for attempt in range(self.cfg.retries + 1):
-                    profile = self.spoof.profile()
-                    headers = self.spoof.headers(profile)
-                    proxy = self.proxies.next()
-                    kwargs = {
-                        "headers": headers,
-                        "impersonate": profile["impersonate"],
-                        "timeout": self.cfg.timeout,
-                        "allow_redirects": True,
-                        "max_redirects": 5,
-                    }
-                    if proxy:
-                        kwargs["proxies"] = {"http": proxy, "https": proxy}
-                    if self.cfg.http_version:
-                        kwargs["http_version"] = self.cfg.http_version
+                response = await asyncio.wait_for(
+                    self.session.get(url, **kwargs),
+                    timeout=self.cfg.timeout + 2.0,
+                )
+                status = response.status_code
+                body = response.content or b""
+                headers = dict(response.headers)
+                elapsed = (time.monotonic() - started) * 1000
+                blocked, reason = self.classifier.classify(status, headers, body)
+                if blocked:
+                    return FetchResult(url, None, status, headers, blocked=True, reason=reason, elapsed_ms=elapsed)
+                if status >= 500:
+                    return FetchResult(url, None, status, headers, error=f"http_{status}", elapsed_ms=elapsed)
+                if status >= 400:
+                    return FetchResult(url, None, status, headers, error=f"http_{status}", elapsed_ms=elapsed)
+                if len(body) < 200:
+                    return FetchResult(url, None, status, headers, error="tiny_body", elapsed_ms=elapsed)
+                return FetchResult(url, body, status, headers, elapsed_ms=elapsed)
+            except asyncio.TimeoutError:
+                return FetchResult(url, None, 0, {}, error="hard_timeout", elapsed_ms=(time.monotonic() - started) * 1000)
+            except _ImpersonateError:
+                if len(self.targets) > 1:
                     try:
-                        response = await self.session.get(url, **kwargs)
-                        status = response.status_code
-                        body = response.content or b""
-                        response_headers = dict(response.headers)
-                        content_type = response_headers.get("content-type", "").split(";")[0].strip().lower()
-                        elapsed = (time.monotonic() - started) * 1000
-                        if self._is_blocked(status, body):
-                            return FetchResult(url, None, status, response_headers, content_type, blocked=True, elapsed_ms=elapsed)
-                        if status >= 500:
-                            if attempt < self.cfg.retries:
-                                await asyncio.sleep(self.spoof.jitter(attempt))
-                                continue
-                            return FetchResult(url, None, status, response_headers, content_type, error=f"http_{status}", elapsed_ms=elapsed)
-                        if status >= 400:
-                            healthy = True
-                            return FetchResult(url, None, status, response_headers, content_type, error=f"http_{status}", elapsed_ms=elapsed)
-                        if len(body) < 200:
-                            return FetchResult(url, None, status, response_headers, content_type, error="tiny_body", elapsed_ms=elapsed)
-                        if len(body) > self.cfg.max_body_bytes:
-                            return FetchResult(url, None, status, response_headers, content_type, error="too_large", elapsed_ms=elapsed)
-                        healthy = True
-                        return FetchResult(url, body, status, response_headers, content_type, elapsed_ms=elapsed)
-                    except _ImpersonateError:
-                        if attempt < self.cfg.retries:
-                            continue
-                        return FetchResult(url, None, 0, {}, error="impersonate", elapsed_ms=(time.monotonic() - started) * 1000)
-                    except (_Timeout, asyncio.TimeoutError):
-                        if attempt < self.cfg.retries:
-                            await asyncio.sleep(self.spoof.jitter(attempt))
-                            continue
-                        return FetchResult(url, None, 0, {}, error="timeout", elapsed_ms=(time.monotonic() - started) * 1000)
-                    except _ProxyError as exc:
-                        if proxy:
-                            self.proxies.mark_bad(proxy)
-                        if attempt < self.cfg.retries:
-                            continue
-                        return FetchResult(url, None, 0, {}, error=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
-                    except _CurlRequestError as exc:
-                        if attempt < self.cfg.retries:
-                            await asyncio.sleep(self.spoof.jitter(attempt))
-                            continue
-                        return FetchResult(url, None, 0, {}, error=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
-                    except OSError as exc:
-                        if attempt < self.cfg.retries:
-                            await asyncio.sleep(self.spoof.jitter(attempt))
-                            continue
-                        return FetchResult(url, None, 0, {}, error=f"os_{type(exc).__name__}", elapsed_ms=(time.monotonic() - started) * 1000)
-                    except Exception as exc:
-                        if attempt < self.cfg.retries:
-                            await asyncio.sleep(self.spoof.jitter(attempt))
-                            continue
-                        return FetchResult(url, None, 0, {}, error=f"unknown_{type(exc).__name__}", elapsed_ms=(time.monotonic() - started) * 1000)
-                return FetchResult(url, None, 0, {}, error="retries_exhausted", elapsed_ms=(time.monotonic() - started) * 1000)
+                        self.targets.remove(target)
+                    except ValueError:
+                        pass
+                return FetchResult(url, None, 0, {}, error="impersonate", elapsed_ms=(time.monotonic() - started) * 1000)
+            except _CurlRequestError as exc:
+                return FetchResult(url, None, 0, {}, error=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
+            except Exception as exc:
+                return FetchResult(url, None, 0, {}, error=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
             finally:
-                if limiter_acquired:
-                    self.limiter.release(healthy)
                 state.active -= 1
 
 
@@ -920,17 +874,16 @@ class Scraper:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.stats = Stats()
-        self.spoof = SpoofEngine()
+        self.classifier = BlockClassifier()
         self.parser = PageParser(cfg)
         self.quality = QualityGate(cfg)
         self.registry = DomainRegistry(cfg)
         self.frontier = Frontier(cfg, self.registry, self.stats)
-        self.writer = ChunkWriter(cfg)
-        self.fetcher = Fetcher(cfg, self.spoof)
+        self.writer = MMapChunkWriter(cfg)
+        self.fetcher = Fetcher(cfg, self.classifier)
 
     async def run(self, seeds: list[str]) -> None:
-        for seed in seeds:
-            await self.frontier.push(seed, 0)
+        await self.frontier.push_many(seeds, 0)
         workers = [asyncio.create_task(self._worker()) for _ in range(self.cfg.workers)]
         stats_task = asyncio.create_task(self._stats_loop())
         try:
@@ -945,7 +898,7 @@ class Scraper:
                 await stats_task
             except (asyncio.CancelledError, Exception):
                 pass
-            self.writer.flush()
+            self.writer.close()
             self._save_session()
             await self.fetcher.close()
 
@@ -965,51 +918,60 @@ class Scraper:
             finally:
                 await self.frontier.done()
 
+    def _parse_and_gate(self, content: bytes, url: str) -> tuple[PageData, bool, str]:
+        page = self.parser.parse(content, url)
+        ok, reason = self.quality.accept(page)
+        return page, ok, reason
+
     async def _process(self, url: str, depth: int) -> None:
         domain = (urlparse(url).hostname or "").lower()
         state = self.registry.get(domain)
         if state.protected:
             self.stats.blocked += 1
+            self.stats.block_reasons["protected"] += 1
             return
         result = await self.fetcher.fetch(url, state)
+        self.stats.fetch_ms += result.elapsed_ms
         if result.blocked:
-            self.registry.mark_blocked(domain)
+            if result.reason == "rate_limit":
+                self.registry.mark_rate_limited(domain)
+            else:
+                self.registry.mark_blocked(domain)
             self.stats.blocked += 1
+            self.stats.block_reasons[result.reason] += 1
             return
         if not result.content:
-            if result.status == 0 or result.status >= 500:
+            if result.error in ("hard_timeout", "impersonate", "tiny_body") or (result.status and result.status >= 500):
                 self.registry.mark_failure(domain)
             else:
                 self.registry.mark_success(domain)
             self.stats.failed += 1
             return
-        if result.content_type and not any(value in result.content_type for value in CONTENT_TYPES):
-            self.registry.mark_success(domain)
-            self.stats.rejected += 1
-            return
         self.registry.mark_success(domain)
         self.stats.bytes_in += len(result.content)
-        page = self.parser.parse(result.content, url)
-        if self.quality.accept(page):
+        started = time.monotonic()
+        page, accepted, reason = await asyncio.to_thread(self._parse_and_gate, result.content, url)
+        self.stats.parse_ms += (time.monotonic() - started) * 1000
+        if accepted:
             self.writer.add(page.title, page.text)
             self.stats.ok += 1
+            await self.frontier.push_many(page.links, depth + 1)
         else:
             self.stats.rejected += 1
-        for link in page.links:
-            await self.frontier.push(link, depth + 1)
-        if self.cfg.max_pages and self.stats.processed() >= self.cfg.max_pages:
-            await self.frontier.close()
+            self.stats.quality_reasons[reason] += 1
 
     async def _stats_loop(self) -> None:
         while True:
             try:
                 await asyncio.sleep(self.cfg.stats_interval)
                 log.info(
-                    "ok=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d chunks=%d records=%d rate=%.1f/s mb=%.1f",
+                    "ok=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d protected=%d chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB fetch=%.0fms parse=%.0fms",
                     self.stats.ok, self.stats.blocked, self.stats.failed, self.stats.rejected,
                     self.stats.dedup, self.frontier.qsize(), self.registry.size(),
-                    self.writer.index, self.writer.records, self.stats.rate(),
-                    self.stats.bytes_in / 1_048_576,
+                    self.registry.protected_count(), self.writer.index, self.writer.records,
+                    self.stats.rate(), self.stats.bytes_in / 1_048_576,
+                    self.stats.bytes_written / 1_048_576,
+                    self.stats.avg_fetch(), self.stats.avg_parse(),
                 )
             except asyncio.CancelledError:
                 raise
@@ -1023,7 +985,7 @@ class Scraper:
         temporary = self.cfg.session_zip.with_suffix(".tmp")
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("frontier.txt", "\n".join(urls))
-            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 3}).decode("utf-8"))
+            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 4}).decode("utf-8"))
         os.replace(temporary, self.cfg.session_zip)
 
 
@@ -1046,6 +1008,9 @@ async def main() -> None:
         level=getattr(logging, cfg.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=cfg.parse_threads, thread_name_prefix="parse"))
+
     seeds = load_session(cfg.session_zip) if cfg.resume else []
     if seeds:
         log.info("resuming from %d queued URLs", len(seeds))
@@ -1067,7 +1032,6 @@ async def main() -> None:
     def _shutdown() -> None:
         shutdown_tasks.append(asyncio.create_task(scraper.frontier.close()))
 
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _shutdown)
@@ -1079,11 +1043,13 @@ async def main() -> None:
     finally:
         s = scraper.stats
         log.info(
-            "final ok=%d blocked=%d failed=%d rejected=%d dedup=%d chunks=%d records=%d rate=%.1f/s",
+            "final ok=%d blocked=%d failed=%d rejected=%d dedup=%d chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB",
             s.ok, s.blocked, s.failed, s.rejected, s.dedup,
             scraper.writer.index, scraper.writer.records, s.rate(),
+            s.bytes_in / 1_048_576, s.bytes_written / 1_048_576,
         )
-        log.info("quality_rejections=%s", dict(scraper.quality.reasons.most_common(12)))
+        log.info("block_reasons=%s", dict(s.block_reasons.most_common(10)))
+        log.info("quality_reasons=%s", dict(s.quality_reasons.most_common(12)))
 
 
 if __name__ == "__main__":
