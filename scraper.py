@@ -8,7 +8,6 @@ import heapq
 import json
 import logging
 import math
-import mmap
 import os
 import random
 import re
@@ -46,13 +45,26 @@ _ImpersonateError = getattr(curl_exc, "ImpersonateError", type("_NeverImpersonat
 _CurlRequestError = curl_exc.RequestException
 
 try:
-    _libc = ctypes.CDLL(None)
-    _memmove = _libc.memmove
-    _memmove.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-    _memmove.restype = ctypes.c_void_p
-except Exception:
-    _libc = None
-    _memmove = None
+    _libc = ctypes.CDLL("libc.so.6")
+except OSError:
+    try:
+        _libc = ctypes.CDLL(None)
+    except OSError:
+        _libc = None
+
+_posix_fadvise = None
+if _libc is not None:
+    try:
+        _posix_fadvise = _libc.posix_fadvise
+        _posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_int]
+        _posix_fadvise.restype = ctypes.c_int
+    except AttributeError:
+        _posix_fadvise = None
+
+POSIX_FADV_SEQUENTIAL = 2
+POSIX_FADV_DONTNEED = 4
+
+_OPEN_FLAGS = getattr(os, "O_BINARY", 0)
 
 BLOCK_STATUS = {403, 407, 451, 503}
 CHALLENGE_MARKERS = (
@@ -110,13 +122,12 @@ class Config:
     chunk_mb: float = 20.0
     max_text_chars: int = 2_000_000
     max_links_per_page: int = 80
-    workers: int = 120
-    concurrency: int = 120
-    per_domain_concurrency: int = 4
-    per_domain_rps: float = 5.0
-    per_domain_burst: float = 8.0
-    timeout: float = 12.0
-    retries: int = 1
+    workers: int = 350
+    concurrency: int = 250
+    per_domain_concurrency: int = 12
+    per_domain_rps: float = 20.0
+    per_domain_burst: float = 20.0
+    timeout: float = 10.0
     max_depth: int = 6
     max_pages: int = 0
     max_queue: int = 200_000
@@ -130,9 +141,9 @@ class Config:
     log_level: str = "INFO"
     proxies: list[str] = field(default_factory=list)
     http_version: str = ""
+    impersonate: str = "chrome136"
     resume: bool = True
-    impersonate_targets: list[str] = field(default_factory=lambda: ["chrome136", "safari184", "firefox133", "chrome"])
-    parse_threads: int = 16
+    parse_threads: int = 24
 
     @property
     def chunk_bytes(self) -> int:
@@ -156,6 +167,7 @@ class Config:
         parser.add_argument("--stats-interval", type=float)
         parser.add_argument("--proxy", action="append")
         parser.add_argument("--http-version")
+        parser.add_argument("--impersonate")
         parser.add_argument("--log-level")
         parser.add_argument("--no-resume", action="store_true")
         args = parser.parse_args()
@@ -180,7 +192,7 @@ class Config:
             "per_domain_rps": args.per_domain_rps, "timeout": args.timeout,
             "max_depth": args.max_depth, "max_pages": args.max_pages,
             "stats_interval": args.stats_interval, "log_level": args.log_level,
-            "http_version": args.http_version,
+            "http_version": args.http_version, "impersonate": args.impersonate,
         }
         for name, value in overrides.items():
             if value is not None:
@@ -195,7 +207,7 @@ class Config:
         if args.no_resume:
             cfg.resume = False
 
-        cfg.workers = max(cfg.workers, cfg.concurrency)
+        cfg.workers = max(cfg.workers, cfg.concurrency + 50)
         return cfg
 
 
@@ -221,8 +233,6 @@ class Stats:
     rejected: int = 0
     dedup: int = 0
     bytes_in: int = 0
-    bytes_written: int = 0
-    records: int = 0
     fetch_ms: float = 0.0
     parse_ms: float = 0.0
     started: float = field(default_factory=time.monotonic)
@@ -236,8 +246,7 @@ class Stats:
         return self.pages() / max(1e-9, time.monotonic() - self.started)
 
     def avg_fetch(self) -> float:
-        n = max(1, self.pages())
-        return self.fetch_ms / n
+        return self.fetch_ms / max(1, self.pages())
 
     def avg_parse(self) -> float:
         return self.parse_ms / max(1, self.ok + self.rejected)
@@ -370,7 +379,7 @@ class BlockClassifier:
         if b"px-captcha" in sample:
             return True, "perimeterx"
         if lower.get("cf-mitigated") == "challenge" or b"cf_chl_opt" in sample or b"/cdn-cgi/challenge-platform/" in sample:
-            return True, "cloudflare_challenge"
+            return True, "cloudflare"
         if status in BLOCK_STATUS:
             return True, f"http_{status}"
         if status == 429:
@@ -461,7 +470,6 @@ class PageParser:
                 node.decompose()
             except Exception:
                 pass
-
         for node in tree.css(_BOILER_SELECTOR):
             try:
                 node.decompose()
@@ -703,10 +711,9 @@ class Frontier:
         return len(self.heap)
 
 
-class MMapChunkWriter:
+class ChunkWriter:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.capacity = cfg.chunk_bytes
         self.dir = cfg.output_dir
         self.dir.mkdir(parents=True, exist_ok=True)
         for stale in self.dir.glob("*.tmp"):
@@ -714,89 +721,87 @@ class MMapChunkWriter:
                 stale.unlink()
             except OSError:
                 pass
+        self.chunk_limit = cfg.chunk_bytes
         self.index = 0
         self.records = 0
         self.bytes_written = 0
         self._fd = -1
-        self._mm: Optional[mmap.mmap] = None
         self._path: Optional[Path] = None
-        self._offset = 0
-        self._count = 0
+        self._tmp_path: Optional[Path] = None
+        self._file_bytes = 0
+        self._record_count = 0
         self._open()
+
+    def _advise(self, fd: int, advice: int) -> None:
+        if _posix_fadvise is None:
+            return
+        try:
+            _posix_fadvise(fd, 0, 0, advice)
+        except OSError:
+            pass
 
     def _open(self) -> None:
         path = self.dir / f"chunk_{self.index:05d}.json"
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC)
-        os.ftruncate(fd, self.capacity)
-        mm = mmap.mmap(fd, self.capacity, access=mmap.ACCESS_WRITE)
-        try:
-            if _libc is not None and hasattr(_libc, "madvise"):
-                _libc.madvise(ctypes.c_void_p.from_buffer(mm), self.capacity, 2)
-        except Exception:
-            pass
+        tmp_path = path.with_suffix(".json.tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _OPEN_FLAGS, 0o644)
+        self._advise(fd, POSIX_FADV_SEQUENTIAL)
+        os.write(fd, b"[")
         self._fd = fd
-        self._mm = mm
         self._path = path
-        self._offset = 0
-        self._count = 0
-        self._write(b"[")
-
-    def _write(self, data: bytes) -> None:
-        n = len(data)
-        if self._offset + n > self.capacity:
-            raise BufferError("chunk overflow")
-        if _memmove is not None and self._mm is not None:
-            dest = ctypes.addressof(ctypes.c_char.from_buffer(self._mm, self._offset))
-            _memmove(dest, data, n)
-        elif self._mm is not None:
-            self._mm[self._offset:self._offset + n] = data
-        else:
-            raise RuntimeError("writer not open")
-        self._offset += n
+        self._tmp_path = tmp_path
+        self._file_bytes = 1
+        self._record_count = 0
 
     def add(self, title: str, text: str) -> None:
         record = {"title": title[:300], "text": text}
         blob = _dumps(record)
-        sep = b"," if self._count else b""
-        needed = len(sep) + len(blob) + 1
-        if self._offset + needed > self.capacity:
+        sep = b"," if self._record_count else b""
+        record_bytes = len(sep) + len(blob)
+        if self._file_bytes + record_bytes + 1 > self.chunk_limit:
             self._finalize()
             self._open()
             sep = b""
-            needed = len(blob) + 1
-            if self._offset + needed > self.capacity:
+            record_bytes = len(blob)
+            if self._file_bytes + record_bytes + 1 > self.chunk_limit:
+                log.warning("record_exceeds_chunk_size bytes=%d", record_bytes)
                 return
-        self._write(sep)
-        self._write(blob)
-        self._count += 1
+        os.write(self._fd, sep)
+        os.write(self._fd, blob)
+        self._file_bytes += record_bytes
+        self._record_count += 1
         self.records += 1
-        self.bytes_written += len(sep) + len(blob)
+        self.bytes_written += record_bytes
 
     def _finalize(self) -> None:
-        if self._mm is None or self._offset <= 1:
-            self._close_empty()
+        if self._fd < 0:
             return
-        self._write(b"]")
-        self._mm.flush()
-        os.ftruncate(self._fd, self._offset)
-        self._mm.close()
-        os.close(self._fd)
-        self._mm = None
-        self._fd = -1
-        self.index += 1
-
-    def _close_empty(self) -> None:
-        if self._mm is not None:
-            self._mm.close()
-        if self._fd >= 0:
-            os.close(self._fd)
-        if self._path is not None:
+        if self._record_count == 0:
             try:
-                self._path.unlink()
+                os.close(self._fd)
             except OSError:
                 pass
-        self._mm = None
-        self._fd = -1
+            try:
+                os.unlink(self._tmp_path)
+            except OSError:
+                pass
+            self._fd = -1
+            return
+        try:
+            os.write(self._fd, b"]")
+            os.fsync(self._fd)
+            self._advise(self._fd, POSIX_FADV_DONTNEED)
+        finally:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = -1
+        try:
+            os.replace(self._tmp_path, self._path)
+        except OSError as exc:
+            log.warning("chunk_rename_failed path=%s err=%s", self._path, exc)
+            return
+        self.index += 1
 
     def close(self) -> None:
         self._finalize()
@@ -807,7 +812,7 @@ class Fetcher:
         self.cfg = cfg
         self.classifier = classifier
         self.session = AsyncSession(max_clients=cfg.concurrency, default_headers=True)
-        self.targets = list(cfg.impersonate_targets)
+        self.impersonate = cfg.impersonate
         self.proxies = ProxyPool(cfg.proxies)
 
     async def close(self) -> None:
@@ -821,10 +826,9 @@ class Fetcher:
         async with state.sem:
             state.active += 1
             started = time.monotonic()
-            target = random.choice(self.targets)
             proxy = self.proxies.next()
             kwargs = {
-                "impersonate": target,
+                "impersonate": self.impersonate,
                 "timeout": self.cfg.timeout,
                 "allow_redirects": True,
                 "max_redirects": 5,
@@ -846,8 +850,6 @@ class Fetcher:
                 blocked, reason = self.classifier.classify(status, headers, body)
                 if blocked:
                     return FetchResult(url, None, status, headers, blocked=True, reason=reason, elapsed_ms=elapsed)
-                if status >= 500:
-                    return FetchResult(url, None, status, headers, error=f"http_{status}", elapsed_ms=elapsed)
                 if status >= 400:
                     return FetchResult(url, None, status, headers, error=f"http_{status}", elapsed_ms=elapsed)
                 if len(body) < 200:
@@ -856,11 +858,6 @@ class Fetcher:
             except asyncio.TimeoutError:
                 return FetchResult(url, None, 0, {}, error="hard_timeout", elapsed_ms=(time.monotonic() - started) * 1000)
             except _ImpersonateError:
-                if len(self.targets) > 1:
-                    try:
-                        self.targets.remove(target)
-                    except ValueError:
-                        pass
                 return FetchResult(url, None, 0, {}, error="impersonate", elapsed_ms=(time.monotonic() - started) * 1000)
             except _CurlRequestError as exc:
                 return FetchResult(url, None, 0, {}, error=type(exc).__name__, elapsed_ms=(time.monotonic() - started) * 1000)
@@ -879,7 +876,7 @@ class Scraper:
         self.quality = QualityGate(cfg)
         self.registry = DomainRegistry(cfg)
         self.frontier = Frontier(cfg, self.registry, self.stats)
-        self.writer = MMapChunkWriter(cfg)
+        self.writer = ChunkWriter(cfg)
         self.fetcher = Fetcher(cfg, self.classifier)
 
     async def run(self, seeds: list[str]) -> None:
@@ -965,12 +962,15 @@ class Scraper:
             try:
                 await asyncio.sleep(self.cfg.stats_interval)
                 log.info(
-                    "ok=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d protected=%d chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB fetch=%.0fms parse=%.0fms",
+                    "ok=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d protected=%d "
+                    "chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB fetch=%.0fms parse=%.0fms",
                     self.stats.ok, self.stats.blocked, self.stats.failed, self.stats.rejected,
                     self.stats.dedup, self.frontier.qsize(), self.registry.size(),
-                    self.registry.protected_count(), self.writer.index, self.writer.records,
-                    self.stats.rate(), self.stats.bytes_in / 1_048_576,
-                    self.stats.bytes_written / 1_048_576,
+                    self.registry.protected_count(),
+                    self.writer.index, self.writer.records,
+                    self.stats.rate(),
+                    self.stats.bytes_in / 1_048_576,
+                    self.writer.bytes_written / 1_048_576,
                     self.stats.avg_fetch(), self.stats.avg_parse(),
                 )
             except asyncio.CancelledError:
@@ -985,7 +985,7 @@ class Scraper:
         temporary = self.cfg.session_zip.with_suffix(".tmp")
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("frontier.txt", "\n".join(urls))
-            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 4}).decode("utf-8"))
+            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 5}).decode("utf-8"))
         os.replace(temporary, self.cfg.session_zip)
 
 
@@ -1046,7 +1046,8 @@ async def main() -> None:
             "final ok=%d blocked=%d failed=%d rejected=%d dedup=%d chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB",
             s.ok, s.blocked, s.failed, s.rejected, s.dedup,
             scraper.writer.index, scraper.writer.records, s.rate(),
-            s.bytes_in / 1_048_576, s.bytes_written / 1_048_576,
+            s.bytes_in / 1_048_576,
+            scraper.writer.bytes_written / 1_048_576,
         )
         log.info("block_reasons=%s", dict(s.block_reasons.most_common(10)))
         log.info("quality_reasons=%s", dict(s.quality_reasons.most_common(12)))
