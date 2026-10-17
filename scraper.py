@@ -9,9 +9,9 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import signal
+import sys
 import time
 import zipfile
 from collections import Counter, OrderedDict, deque
@@ -44,22 +44,22 @@ log = logging.getLogger("scraper")
 _ImpersonateError = getattr(curl_exc, "ImpersonateError", type("_NeverImpersonate", (Exception,), {}))
 _CurlRequestError = curl_exc.RequestException
 
-try:
-    _libc = ctypes.CDLL("libc.so.6")
-except OSError:
-    try:
-        _libc = ctypes.CDLL(None)
-    except OSError:
-        _libc = None
-
 _posix_fadvise = None
-if _libc is not None:
-    try:
-        _posix_fadvise = _libc.posix_fadvise
-        _posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_int]
-        _posix_fadvise.restype = ctypes.c_int
-    except AttributeError:
-        _posix_fadvise = None
+if sys.platform != "win32":
+    _libc = None
+    for _name in ("libc.so.6", "libc.dylib", "libc.so"):
+        try:
+            _libc = ctypes.CDLL(_name, use_errno=True)
+            break
+        except OSError:
+            continue
+    if _libc is not None:
+        try:
+            _posix_fadvise = _libc.posix_fadvise
+            _posix_fadvise.argtypes = [ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.c_int]
+            _posix_fadvise.restype = ctypes.c_int
+        except AttributeError:
+            _posix_fadvise = None
 
 POSIX_FADV_SEQUENTIAL = 2
 POSIX_FADV_DONTNEED = 4
@@ -112,6 +112,7 @@ _TOKEN_RE = re.compile(r"[A-Za-z\u00C0-\u024F']+")
 _WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]{2,}")
 _ZW_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff]")
 _WS_RE = re.compile(r"\s+")
+_MULTI_SLASH_RE = re.compile(r"/{2,}")
 
 
 @dataclass
@@ -144,6 +145,7 @@ class Config:
     impersonate: str = "chrome136"
     resume: bool = True
     parse_threads: int = 24
+    fsync_chunks: bool = field(default_factory=lambda: sys.platform != "win32")
 
     @property
     def chunk_bytes(self) -> int:
@@ -170,6 +172,7 @@ class Config:
         parser.add_argument("--impersonate")
         parser.add_argument("--log-level")
         parser.add_argument("--no-resume", action="store_true")
+        parser.add_argument("--no-fsync", action="store_true")
         args = parser.parse_args()
 
         cfg = cls()
@@ -206,6 +209,8 @@ class Config:
             cfg.proxies = args.proxy
         if args.no_resume:
             cfg.resume = False
+        if args.no_fsync:
+            cfg.fsync_chunks = False
 
         cfg.workers = max(cfg.workers, cfg.concurrency + 50)
         return cfg
@@ -477,7 +482,9 @@ class PageParser:
                 pass
 
         body = tree.body or tree.root
-        raw = body.text(separator=" ", strip=True) if body else ""
+        if body is None:
+            return PageData(title=title, text="", links=links, link_chars=link_chars, html_len=len(html))
+        raw = body.text(separator=" ", strip=True) or ""
         text = _clean_text(raw)[: self.cfg.max_text_chars]
         return PageData(title=title, text=text, links=links, link_chars=link_chars, html_len=len(html))
 
@@ -619,7 +626,7 @@ class Frontier:
         port = parsed.port
         if port and port not in (80, 443):
             host = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-        path = re.sub(r"/{2,}", "/", parsed.path) or "/"
+        path = _MULTI_SLASH_RE.sub("/", parsed.path) or "/"
         lower_path = path.lower()
         if any(lower_path.endswith(extension) for extension in SKIP_EXT):
             return None
@@ -671,6 +678,7 @@ class Frontier:
         if not prepared:
             return 0
         async with self.condition:
+            pushed = 0
             for priority, normalized, d in prepared:
                 if len(self.heap) >= self.cfg.max_queue:
                     break
@@ -678,8 +686,10 @@ class Frontier:
                 self.sequence += 1
                 heapq.heappush(self.heap, (priority, self.sequence, normalized, d))
                 self.tail.append(normalized)
-            self.condition.notify_all()
-        return len(prepared)
+                pushed += 1
+            if pushed:
+                self.condition.notify(pushed)
+        return pushed
 
     async def pop(self) -> Optional[tuple[int, int, str, int]]:
         async with self.condition:
@@ -704,6 +714,8 @@ class Frontier:
     async def close(self) -> None:
         async with self.condition:
             self.closed = True
+            dropped = len(self.heap)
+            self.outstanding = max(0, self.outstanding - dropped)
             self.heap.clear()
             self.condition.notify_all()
 
@@ -742,7 +754,7 @@ class ChunkWriter:
 
     def _open(self) -> None:
         path = self.dir / f"chunk_{self.index:05d}.json"
-        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path = self.dir / f"chunk_{self.index:05d}.json.tmp"
         fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _OPEN_FLAGS, 0o644)
         self._advise(fd, POSIX_FADV_SEQUENTIAL)
         os.write(fd, b"[")
@@ -765,7 +777,8 @@ class ChunkWriter:
             if self._file_bytes + record_bytes + 1 > self.chunk_limit:
                 log.warning("record_exceeds_chunk_size bytes=%d", record_bytes)
                 return
-        os.write(self._fd, sep)
+        if sep:
+            os.write(self._fd, sep)
         os.write(self._fd, blob)
         self._file_bytes += record_bytes
         self._record_count += 1
@@ -788,8 +801,14 @@ class ChunkWriter:
             return
         try:
             os.write(self._fd, b"]")
-            os.fsync(self._fd)
+            if self.cfg.fsync_chunks:
+                try:
+                    os.fsync(self._fd)
+                except OSError as exc:
+                    log.warning("chunk_fsync_failed path=%s err=%s", self._path, exc)
             self._advise(self._fd, POSIX_FADV_DONTNEED)
+        except OSError as exc:
+            log.warning("chunk_write_close_failed path=%s err=%s", self._path, exc)
         finally:
             try:
                 os.close(self._fd)
@@ -956,6 +975,8 @@ class Scraper:
         else:
             self.stats.rejected += 1
             self.stats.quality_reasons[reason] += 1
+        if self.cfg.max_pages and self.stats.pages() >= self.cfg.max_pages:
+            await self.frontier.close()
 
     async def _stats_loop(self) -> None:
         while True:
@@ -985,7 +1006,7 @@ class Scraper:
         temporary = self.cfg.session_zip.with_suffix(".tmp")
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("frontier.txt", "\n".join(urls))
-            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 5}).decode("utf-8"))
+            archive.writestr("meta.json", _dumps({"ts": time.time(), "version": 6}).decode("utf-8"))
         os.replace(temporary, self.cfg.session_zip)
 
 
@@ -1035,7 +1056,7 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _shutdown)
-        except (NotImplementedError, RuntimeError):
+        except (NotImplementedError, RuntimeError, AttributeError):
             pass
 
     try:
