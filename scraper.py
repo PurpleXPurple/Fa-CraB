@@ -58,7 +58,7 @@ class Config:
     session_zip: Path = Path("session.zip")
     chunk_mb: float = 20.0
     max_text_chars: int = 2_000_000
-    max_links_per_page: int = 80
+    max_links_per_page: int = 200
     workers: int = 350
     concurrency: int = 100
     per_domain_concurrency: int = 12
@@ -83,6 +83,8 @@ class Config:
     resume: bool = True
     parse_threads: int = min(24, os.cpu_count() or 1)
     fsync_chunks: bool = sys.platform != "win32"
+    llt_max_script_bytes: int = 1_000_000
+    llt_max_state_bytes: int = 4_000_000
 
 
 @dataclass
@@ -272,6 +274,45 @@ SITEMAP_LOC_RE = re.compile(r"<loc>\s*([^<]+?)\s*</loc>")
 ROBOTS_SITEMAP_RE = re.compile(r"^\s*sitemap:\s*(\S+)", re.IGNORECASE | re.MULTILINE)
 ARCHIVE_HUB_RE = re.compile(r"/\d{4}/\d{2}/?$")
 
+META_REFRESH_RE = re.compile(r"url\s*=\s*([^;\"'\s]+)", re.IGNORECASE)
+LOCATION_RE = re.compile(r"""(?:window\.)?location(?:\.href)?\s*=\s*["']([^"']+)["']""")
+LOCATION_ASSIGN_RE = re.compile(r"""location\.(?:assign|replace)\s*\(\s*["']([^"']+)["']\s*\)""")
+WINDOW_OPEN_RE = re.compile(r"""window\.open\s*\(\s*["']([^"']+)["']""")
+ROUTER_PUSH_RE = re.compile(r"""(?:router|history)\.push(?:State)?\s*\(\s*(?:[^,]+,\s*)?["']([^"']+)["']""")
+URL_IN_JS_RE = re.compile(r"""["']((?:https?:)?//[^"'\\\s]{4,}|/[a-zA-Z0-9_\-./?=&%#]{2,})["']""")
+CSS_URL_RE = re.compile(r"""url\(\s*["']?([^"')\s]+)["']?\s*\)""")
+HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.DOTALL)
+ANCHOR_IN_COMMENT_RE = re.compile(r"""href\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+BARE_URL_RE = re.compile(r"""(https?://[^\s<>"'`)\]]+)""")
+
+_NON_PAGE_SUFFIXES = frozenset([
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tiff", ".avif",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".avi", ".mov", ".m3u8",
+    ".css", ".js", ".mjs", ".cjs", ".map", ".wasm",
+    ".exe", ".dmg", ".iso", ".apk",
+])
+
+_LINK_RELS = frozenset([
+    "canonical", "alternate", "next", "prev", "author", "me",
+    "index", "up", "first", "last", "help", "license", "search",
+    "tag", "contents", "start", "chapter",
+])
+
+_META_URL_PROPS = frozenset([
+    "og:url", "twitter:url", "og:image", "og:image:url", "og:video",
+    "og:see_also", "twitter:image", "twitter:image:src",
+])
+
+_DATA_ATTRS = (
+    "data-href", "data-url", "data-link", "data-src", "data-target",
+    "data-to", "data-path", "data-route", "data-action", "data-destination",
+    "data-permalink", "data-href-template", "data-ajax", "data-endpoint",
+    "data-original", "data-lazy-src", "data-lazy-href", "data-href-slug",
+)
+
+_EVENT_ATTRS = ("onclick", "onmousedown", "onmouseup", "onkeydown", "onkeypress")
+
 TRACKING_PARAMS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "source", "campaign",
@@ -330,12 +371,347 @@ def _open_fd_count():
         return -1
 
 
-class PageParser:
-    __slots__ = ("_max_links", "_max_text")
+class LLT:
+    __slots__ = ("_max_links", "_max_script_bytes", "_max_state_bytes", "_layer_stats")
 
-    def __init__(self, max_links, max_text):
+    LAYERS = (
+        "anchor", "area", "link_tag", "jsonld", "meta_refresh", "meta_url",
+        "iframe_src", "object_embed", "form_action", "state_blob",
+        "data_attrs", "event_handlers", "inline_script", "css_url",
+        "comments", "text_urls",
+    )
+
+    def __init__(self, max_links, max_script_bytes=1_000_000, max_state_bytes=4_000_000):
         self._max_links = max_links
+        self._max_script_bytes = max_script_bytes
+        self._max_state_bytes = max_state_bytes
+        self._layer_stats = Counter()
+
+    def extract(self, tree, html, base_url):
+        links = []
+        seen = set()
+        link_chars = 0
+        self._layer_stats.clear()
+
+        try:
+            base_node = tree.css_first("base[href]")
+            if base_node:
+                bh = base_node.attributes.get("href")
+                if bh:
+                    base_url = urljoin(base_url, bh)
+        except Exception:
+            pass
+
+        def add(href):
+            if not href or not isinstance(href, str):
+                return
+            href = href.strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "file:", "about:", "blob:", "chrome:", "chrome-extension:", "ftp:")):
+                return
+            path_part = href.split("?", 1)[0].split("#", 1)[0].lower()
+            if "." in path_part:
+                ext = "." + path_part.rsplit(".", 1)[-1]
+                if ext in _NON_PAGE_SUFFIXES:
+                    return
+            try:
+                resolved = urljoin(base_url, href)
+            except ValueError:
+                return
+            if not resolved.startswith(("http://", "https://")):
+                return
+            if resolved in seen:
+                return
+            if len(links) >= self._max_links:
+                return
+            seen.add(resolved)
+            links.append(resolved)
+
+        def at_cap():
+            return len(links) >= self._max_links
+
+        try:
+            anchors = tree.css("a[href]")
+        except Exception:
+            anchors = []
+            try:
+                for node in tree.iter():
+                    if node.tag == "a" and node.attributes.get("href"):
+                        anchors.append(node)
+            except Exception:
+                pass
+
+        for node in anchors:
+            if at_cap():
+                break
+            href = node.attributes.get("href")
+            if href:
+                try:
+                    link_chars += len(node.text(strip=True))
+                except Exception:
+                    pass
+                add(href)
+        self._layer_stats["anchor"] = len(links)
+
+        try:
+            for node in tree.css("area[href]"):
+                if at_cap():
+                    break
+                add(node.attributes.get("href"))
+        except Exception:
+            pass
+        self._layer_stats["area"] = len(links)
+
+        try:
+            for node in tree.css("link[href]"):
+                if at_cap():
+                    break
+                rel = (node.attributes.get("rel") or "").lower()
+                if set(rel.split()) & _LINK_RELS:
+                    add(node.attributes.get("href"))
+        except Exception:
+            pass
+        self._layer_stats["link_tag"] = len(links)
+
+        try:
+            for node in tree.css('script[type="application/ld+json"]'):
+                if at_cap():
+                    break
+                raw = node.text()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                for u in self._walk_jsonld(data):
+                    add(u)
+                    if at_cap():
+                        break
+        except Exception:
+            pass
+        self._layer_stats["jsonld"] = len(links)
+
+        try:
+            for node in tree.css("meta[http-equiv]"):
+                if at_cap():
+                    break
+                equiv = (node.attributes.get("http-equiv") or "").lower()
+                if equiv in ("refresh", "location"):
+                    content = node.attributes.get("content") or ""
+                    m = META_REFRESH_RE.search(content)
+                    if m:
+                        add(m.group(1))
+        except Exception:
+            pass
+        self._layer_stats["meta_refresh"] = len(links)
+
+        try:
+            for node in tree.css("meta[property],meta[name]"):
+                if at_cap():
+                    break
+                prop = (node.attributes.get("property") or node.attributes.get("name") or "").lower()
+                if prop in _META_URL_PROPS:
+                    content = node.attributes.get("content")
+                    if content:
+                        add(content)
+        except Exception:
+            pass
+        self._layer_stats["meta_url"] = len(links)
+
+        try:
+            for node in tree.css("iframe[src]"):
+                if at_cap():
+                    break
+                add(node.attributes.get("src"))
+        except Exception:
+            pass
+        self._layer_stats["iframe_src"] = len(links)
+
+        try:
+            for node in tree.css("object[data],embed[src]"):
+                if at_cap():
+                    break
+                add(node.attributes.get("data") or node.attributes.get("src"))
+        except Exception:
+            pass
+        self._layer_stats["object_embed"] = len(links)
+
+        try:
+            for node in tree.css("form[action]"):
+                if at_cap():
+                    break
+                method = (node.attributes.get("method") or "get").lower()
+                if method == "get":
+                    add(node.attributes.get("action"))
+        except Exception:
+            pass
+        self._layer_stats["form_action"] = len(links)
+
+        try:
+            state_pattern = re.compile(
+                r'<script[^>]*(?:id=["\'](?:__NEXT_DATA__|__NUXT__|__APOLLO_STATE__|__INITIAL_STATE__|__PRELOADED_STATE__)["\']|type=["\']application/json["\'])',
+                re.IGNORECASE,
+            )
+            for m in state_pattern.finditer(html):
+                if at_cap():
+                    break
+                start = m.end()
+                end = html.find("</script>", start)
+                if end < 0:
+                    continue
+                blob = html[start:end]
+                if len(blob) > self._max_state_bytes:
+                    blob = blob[: self._max_state_bytes]
+                for u in self._urls_in_js(blob, full=True):
+                    add(u)
+                    if at_cap():
+                        break
+        except Exception:
+            pass
+        self._layer_stats["state_blob"] = len(links)
+
+        try:
+            for node in tree.iter():
+                if at_cap():
+                    break
+                attrs = node.attributes
+                if not attrs:
+                    continue
+                for attr in _DATA_ATTRS:
+                    val = attrs.get(attr)
+                    if val:
+                        if "{" in val or "}" in val:
+                            continue
+                        add(val)
+                for attr in _EVENT_ATTRS:
+                    val = attrs.get(attr)
+                    if val:
+                        for u in self._urls_in_js(val):
+                            add(u)
+                            if at_cap():
+                                break
+                style = attrs.get("style")
+                if style and "url(" in style:
+                    for m in CSS_URL_RE.finditer(style):
+                        add(m.group(1))
+                        if at_cap():
+                            break
+        except Exception:
+            pass
+        self._layer_stats["data_attrs"] = len(links)
+        self._layer_stats["event_handlers"] = len(links)
+
+        try:
+            for node in tree.css("script"):
+                if at_cap():
+                    break
+                stype = (node.attributes.get("type") or "").lower()
+                if stype and "javascript" not in stype and "module" not in stype and "ecmascript" not in stype:
+                    continue
+                body = node.text() or ""
+                if not body or len(body) > self._max_script_bytes:
+                    if len(body) > self._max_script_bytes:
+                        body = body[: self._max_script_bytes]
+                    if not body:
+                        continue
+                for u in self._urls_in_js(body):
+                    add(u)
+                    if at_cap():
+                        break
+        except Exception:
+            pass
+        self._layer_stats["inline_script"] = len(links)
+
+        try:
+            for node in tree.css("style"):
+                if at_cap():
+                    break
+                body = node.text() or ""
+                if "url(" in body:
+                    for m in CSS_URL_RE.finditer(body):
+                        add(m.group(1))
+                        if at_cap():
+                            break
+        except Exception:
+            pass
+        self._layer_stats["css_url"] = len(links)
+
+        try:
+            for m in HTML_COMMENT_RE.finditer(html):
+                if at_cap():
+                    break
+                body = m.group(1)
+                for u in ANCHOR_IN_COMMENT_RE.findall(body):
+                    add(u)
+                    if at_cap():
+                        break
+        except Exception:
+            pass
+        self._layer_stats["comments"] = len(links)
+
+        if len(links) < 5:
+            try:
+                for m in BARE_URL_RE.finditer(html):
+                    if at_cap():
+                        break
+                    u = m.group(1).rstrip(".,;:!?)")
+                    add(u)
+            except Exception:
+                pass
+        self._layer_stats["text_urls"] = len(links)
+
+        return links, link_chars
+
+    def layer_stats(self):
+        return dict(self._layer_stats)
+
+    @classmethod
+    def _walk_jsonld(cls, obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in ("url", "@id", "sameAs", "mainEntityOfPage", "identifier", "contentUrl", "embedUrl", "thumbnailUrl"):
+                    if isinstance(v, str):
+                        yield v
+                    elif isinstance(v, dict):
+                        yield from cls._walk_jsonld(v)
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str):
+                                yield item
+                            elif isinstance(item, dict):
+                                yield from cls._walk_jsonld(item)
+                elif k in ("target", "object", "itemListElement", "item"):
+                    yield from cls._walk_jsonld(v)
+                else:
+                    if isinstance(v, (dict, list)):
+                        yield from cls._walk_jsonld(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from cls._walk_jsonld(item)
+
+    @staticmethod
+    def _urls_in_js(body, full=False):
+        if not body:
+            return
+        for m in LOCATION_RE.finditer(body):
+            yield m.group(1)
+        for m in LOCATION_ASSIGN_RE.finditer(body):
+            yield m.group(1)
+        for m in WINDOW_OPEN_RE.finditer(body):
+            yield m.group(1)
+        for m in ROUTER_PUSH_RE.finditer(body):
+            yield m.group(1)
+        if full or len(body) <= 500_000:
+            for m in URL_IN_JS_RE.finditer(body):
+                yield m.group(1)
+
+
+class PageParser:
+    __slots__ = ("_max_text", "_llt")
+
+    def __init__(self, max_links, max_text, max_script_bytes=1_000_000, max_state_bytes=4_000_000):
         self._max_text = max_text
+        self._llt = LLT(max_links, max_script_bytes, max_state_bytes)
 
     def parse(self, html, base_url):
         try:
@@ -355,44 +731,10 @@ class PageParser:
                     title = t[:300]
                     break
 
-        links = []
-        seen = set()
-        link_chars = 0
-
         try:
-            if tree.root is not None:
-                node_iter = tree.root.iter()
-                filter_tag = True
-            else:
-                node_iter = tree.css("a[href]")
-                filter_tag = False
-        except (AttributeError, Exception):
-            try:
-                node_iter = tree.css("a[href]")
-            except Exception:
-                node_iter = []
-            filter_tag = False
-
-        for node in node_iter:
-            if filter_tag and node.tag != "a":
-                continue
-            href = node.attributes.get("href") or ""
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
-                continue
-            try:
-                resolved = urljoin(base_url, href)
-            except ValueError:
-                continue
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            links.append(resolved)
-            try:
-                link_chars += len(node.text(strip=True))
-            except Exception:
-                pass
-            if len(links) >= self._max_links:
-                break
+            links, link_chars = self._llt.extract(tree, html, base_url)
+        except Exception:
+            links, link_chars = [], 0
 
         try:
             for node in tree.css(COMBINED_SELECTOR):
@@ -412,6 +754,9 @@ class PageParser:
         if len(text) > self._max_text:
             text = text[: self._max_text]
         return PageData(title, text, links, link_chars, len(html))
+
+    def layer_stats(self):
+        return self._llt.layer_stats()
 
 
 class QualityGate:
@@ -980,7 +1325,7 @@ class Scraper:
         self.stats = Stats()
         self.fetcher = Fetcher(cfg)
         self.classifier = BlockClassifier()
-        self.parser = PageParser(cfg.max_links_per_page, cfg.max_text_chars)
+        self.parser = PageParser(cfg.max_links_per_page, cfg.max_text_chars, cfg.llt_max_script_bytes, cfg.llt_max_state_bytes)
         self.gate = QualityGate(cfg.simhash_items)
         self.registry = DomainRegistry(cfg.max_domains, cfg.per_domain_concurrency, cfg.per_domain_rps, cfg.per_domain_burst, cfg.protect_after, cfg.rate_limit_cooldown)
         self.frontier = Frontier(cfg.bloom_capacity, cfg.bloom_error, self.registry, self.stats, cfg.max_queue)
@@ -1154,7 +1499,7 @@ class Scraper:
             if fallback != url:
                 await self.frontier.push_many([fallback], depth, discovery=True)
             elif not page.links:
-                self._log.warning("seed dead-end: %s produced zero links", url)
+                self._log.warning("seed dead-end: %s produced zero links after LLT (html=%d bytes)", url, page.html_len)
 
         if verdict.tier in ("good", "flagged") and depth < self.cfg.max_depth and page.links:
             await self.frontier.push_many(page.links, depth + 1)
@@ -1201,6 +1546,7 @@ class Scraper:
         self._log.info("quality_reasons=%s", self.stats.quality_reasons.most_common(12))
         self._log.info("top_domains_by_fetch=%s", self._domain_fetch.most_common(10))
         self._log.info("top_domains_by_block=%s", self._domain_block.most_common(10))
+        self._log.info("llt_layer_stats=%s", self.parser.layer_stats())
         seeds = list(self._recent)
         blocked = self.registry.blocked_domains()
         tmp = Path(str(self.cfg.session_zip) + ".tmp")
@@ -1279,6 +1625,7 @@ def _load_config():
     if cfg.workers < cfg.concurrency + 50:
         cfg.workers = cfg.concurrency + 50
     cfg.parse_threads = max(1, min(64, cfg.parse_threads))
+    cfg.max_links_per_page = max(20, min(2000, cfg.max_links_per_page))
     return cfg
 
 
@@ -1331,12 +1678,14 @@ async def main():
         print("no seed url provided", file=sys.stderr)
         return
     scraper = Scraper(cfg)
+
     def _shutdown():
         now = time.monotonic()
         if now - _last_sigint[0] < 2.0:
             os._exit(1)
         _last_sigint[0] = now
         shutdown_tasks.append(asyncio.create_task(scraper.frontier.close()))
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _shutdown)
