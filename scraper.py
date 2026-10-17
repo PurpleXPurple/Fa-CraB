@@ -1,6 +1,7 @@
 import asyncio
 import ctypes
 import hashlib
+import heapq
 import json
 import logging
 import math
@@ -11,7 +12,7 @@ import sys
 import threading
 import time
 import zipfile
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -34,6 +35,11 @@ try:
 except ImportError:
     def _dumps(obj):
         return json.dumps(obj, ensure_ascii=False).encode()
+
+try:
+    threading.stack_size(512 * 1024)
+except (ValueError, RuntimeError):
+    pass
 
 shutdown_tasks = []
 
@@ -262,7 +268,6 @@ BOILER_SELECTOR = (
 
 WS_RE = re.compile(r"\s+")
 JS_RESIDUE_RE = re.compile(r"function|var |let |const |document\.|window\.|=>\{|addEventListener")
-ALNUM_RE = re.compile(r"[A-Za-z0-9]")
 WORD_RE = re.compile(r"[A-Za-z\u00C0-\u024F]{2,}")
 TOKEN_RE = re.compile(r"[A-Za-z\u00C0-\u024F']+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?。！？])\s+")
@@ -304,6 +309,15 @@ def _init_fadvise():
             return
         except (OSError, AttributeError):
             continue
+
+
+def _fadvise(fd, advice):
+    if _POSIX_ADVISE is None:
+        return
+    try:
+        _POSIX_ADVISE(fd, 0, 0, advice)
+    except Exception:
+        pass
 
 
 class PageParser:
@@ -362,41 +376,46 @@ class QualityGate:
         self._lock = threading.Lock()
 
     def check(self, text, link_chars, html_len):
-        if len(text) < 300:
-            return False, "short"
+        if len(text) < 100:
+            return "reject", ["empty"]
+        reasons = []
         head = text[:10240]
         alnum = sum(1 for c in head if c.isalnum())
         if alnum / max(1, len(head)) < 0.32:
-            return False, "low_alnum"
+            reasons.append("low_alnum")
         if JS_RESIDUE_RE.search(head):
-            return False, "js_residue"
+            reasons.append("js_residue")
         if head.count("<") > 5 or head.count("{") > 15:
-            return False, "code_residue"
+            reasons.append("code_residue")
         words = WORD_RE.findall(head)
         if len(words) < 50:
-            return False, "few_words"
-        if len(set(words)) / len(words) < 0.16:
-            return False, "low_uniqueness"
+            reasons.append("few_words")
+        elif len(set(words)) / len(words) < 0.16:
+            reasons.append("low_uniqueness")
         sentences = [s for s in SENTENCE_SPLIT_RE.split(text) if len(s) > 10]
         if len(sentences) < 3:
-            return False, "few_sentences"
-        mean_len = sum(len(s) for s in sentences) / len(sentences)
-        if not (25 <= mean_len <= 350):
-            return False, "sentence_len"
+            reasons.append("few_sentences")
+        else:
+            mean_len = sum(len(s) for s in sentences) / len(sentences)
+            if not (25 <= mean_len <= 350):
+                reasons.append("sentence_len")
         tokens = TOKEN_RE.findall(text)
         if not tokens:
-            return False, "no_tokens"
-        stop_ratio = sum(1 for t in tokens if t.lower() in STOPWORDS) / len(tokens)
-        if not (0.06 <= stop_ratio <= 0.45):
-            return False, "stopword_ratio"
+            reasons.append("no_tokens")
+        else:
+            stop_ratio = sum(1 for t in tokens if t.lower() in STOPWORDS) / len(tokens)
+            if not (0.06 <= stop_ratio <= 0.45):
+                reasons.append("stopword_ratio")
         if link_chars / max(1, len(text)) > 0.25:
-            return False, "link_heavy"
+            reasons.append("link_heavy")
         if len(text) / max(1, html_len) < 0.02:
-            return False, "low_text_html"
+            reasons.append("low_text_html")
         sh = self._simhash(text[:6000])
         if self._near_dup(sh):
-            return False, "near_duplicate"
-        return True, ""
+            reasons.append("near_duplicate")
+        if reasons:
+            return "flagged", reasons
+        return "good", []
 
     @staticmethod
     def _simhash(text):
@@ -487,14 +506,14 @@ class Frontier:
         self._max_queue = max_queue
 
     async def push_many(self, urls, depth):
-        pushed = 0
+        if not urls:
+            return
         normalized = []
         for url in urls:
             u = self._normalize(url)
             if not u:
                 continue
-            host = urlparse(u).hostname or ""
-            host = host.removeprefix("www.")
+            host = (urlparse(u).hostname or "").removeprefix("www.")
             state = await self._registry.get(host)
             if state.protected or state.cooldown_until > time.monotonic():
                 continue
@@ -518,6 +537,7 @@ class Frontier:
         async with self._cond:
             if self._closed:
                 return
+            pushed = 0
             for priority, u, d in normalized:
                 if len(self._heap) >= self._max_queue:
                     break
@@ -593,13 +613,10 @@ class Frontier:
         return len(self._heap)
 
 
-import heapq
-
-
 class ChunkWriter:
-    __slots__ = ("_dir", "_max_bytes", "_fsync", "_fd", "_tmp", "_final", "_file_bytes", "_count", "_index", "_lock", "_log")
+    __slots__ = ("_dir", "_max_bytes", "_fsync", "_include_quality", "_fd", "_tmp", "_final", "_file_bytes", "_count", "_total", "_index", "_lock", "_log")
 
-    def __init__(self, output_dir, chunk_mb, fsync):
+    def __init__(self, output_dir, chunk_mb, fsync, include_quality=False):
         self._dir = Path(output_dir)
         self._dir.mkdir(parents=True, exist_ok=True)
         for f in self._dir.glob("*.tmp"):
@@ -609,7 +626,9 @@ class ChunkWriter:
                 pass
         self._max_bytes = int(chunk_mb * 1024 * 1024)
         self._fsync = fsync
+        self._include_quality = include_quality
         self._index = 0
+        self._total = 0
         self._lock = threading.Lock()
         self._log = logging.getLogger("scraper")
         self._open_new()
@@ -621,12 +640,17 @@ class ChunkWriter:
         if sys.platform == "win32":
             flags |= os.O_BINARY
         self._fd = os.open(self._tmp, flags, 0o644)
+        _fadvise(self._fd, 2)
         os.write(self._fd, b"[")
         self._file_bytes = 1
         self._count = 0
 
-    def add(self, title, text):
-        blob = _dumps({"title": title[:300], "text": text})
+    def add(self, title, text, quality=None):
+        if self._include_quality and quality is not None:
+            record = {"title": title[:300], "text": text, "quality": quality}
+        else:
+            record = {"title": title[:300], "text": text}
+        blob = _dumps(record)
         sep = b"," if self._count > 0 else b""
         needed = len(blob) + len(sep) + 1
         if self._file_bytes + needed > self._max_bytes:
@@ -638,6 +662,7 @@ class ChunkWriter:
             os.write(self._fd, sep + blob)
             self._file_bytes += needed
             self._count += 1
+            self._total += 1
 
     def _finalize(self):
         if self._count == 0:
@@ -649,25 +674,37 @@ class ChunkWriter:
                 self._tmp.unlink()
             except OSError:
                 pass
+            self._index += 1
             return
+        write_ok = True
         try:
             os.write(self._fd, b"]")
-            if self._fsync:
-                try:
-                    os.fsync(self._fd)
-                except OSError as e:
-                    self._log.error("fsync failed: %s", e)
         except OSError as e:
             self._log.error("write close bracket failed: %s", e)
-        finally:
+            write_ok = False
+        if self._fsync:
             try:
-                os.close(self._fd)
+                os.fsync(self._fd)
+            except OSError as e:
+                self._log.error("fsync failed: %s", e)
+        try:
+            os.close(self._fd)
+        except OSError as e:
+            self._log.error("close failed: %s", e)
+        if write_ok:
+            try:
+                os.replace(self._tmp, self._final)
+            except OSError as e:
+                self._log.error("rename failed: %s", e)
+                try:
+                    self._tmp.unlink()
+                except OSError:
+                    pass
+        else:
+            try:
+                self._tmp.unlink()
             except OSError:
                 pass
-        try:
-            os.replace(self._tmp, self._final)
-        except OSError as e:
-            self._log.error("rename failed: %s", e)
         self._index += 1
 
     def close(self):
@@ -675,10 +712,11 @@ class ChunkWriter:
 
 
 class Stats:
-    __slots__ = ("ok", "blocked", "failed", "rejected", "dedup", "bytes_in", "bytes_out", "fetch_ms", "parse_ms", "fetch_n", "parse_n", "start", "block_reasons", "quality_reasons")
+    __slots__ = ("ok", "flagged", "blocked", "failed", "rejected", "dedup", "bytes_in", "bytes_out", "fetch_ms", "parse_ms", "fetch_n", "parse_n", "start", "block_reasons", "quality_reasons")
 
     def __init__(self):
         self.ok = 0
+        self.flagged = 0
         self.blocked = 0
         self.failed = 0
         self.rejected = 0
@@ -694,7 +732,7 @@ class Stats:
         self.quality_reasons = Counter()
 
     def pages(self):
-        return self.ok + self.blocked + self.failed + self.rejected
+        return self.ok + self.flagged + self.blocked + self.failed + self.rejected
 
 
 class Fetcher:
@@ -738,7 +776,7 @@ class Fetcher:
 
 
 class Scraper:
-    __slots__ = ("cfg", "stats", "fetcher", "classifier", "parser", "gate", "registry", "frontier", "writer", "_log", "_recent")
+    __slots__ = ("cfg", "stats", "fetcher", "classifier", "parser", "gate", "registry", "frontier", "writer_good", "writer_flagged", "_log", "_recent")
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -749,9 +787,10 @@ class Scraper:
         self.gate = QualityGate(cfg.simhash_items)
         self.registry = DomainRegistry(cfg.max_domains, cfg.per_domain_concurrency, cfg.per_domain_rps, cfg.per_domain_burst, cfg.protect_after, cfg.rate_limit_cooldown)
         self.frontier = Frontier(cfg.bloom_capacity, cfg.bloom_error, self.registry, self.stats, cfg.max_queue)
-        self.writer = ChunkWriter(cfg.output_dir, cfg.chunk_mb, cfg.fsync_chunks)
+        self.writer_good = ChunkWriter(cfg.output_dir, cfg.chunk_mb, cfg.fsync_chunks, include_quality=False)
+        self.writer_flagged = ChunkWriter(Path(cfg.output_dir) / "flagged", cfg.chunk_mb, cfg.fsync_chunks, include_quality=True)
         self._log = logging.getLogger("scraper")
-        self._recent = []
+        self._recent = deque(maxlen=10)
 
     async def run(self, seeds):
         await self.frontier.push_many(seeds, 0)
@@ -766,7 +805,8 @@ class Scraper:
             await asyncio.gather(*workers, return_exceptions=True)
             stats_task.cancel()
             await asyncio.gather(stats_task, return_exceptions=True)
-            self.writer.close()
+            self.writer_good.close()
+            self.writer_flagged.close()
             self._save_session()
             await self.fetcher.close()
 
@@ -787,6 +827,11 @@ class Scraper:
                 await self.frontier.close()
                 return
 
+    def _parse_and_gate(self, html, url):
+        page = self.parser.parse(html, url)
+        verdict, reasons = self.gate.check(page.text, page.link_chars, page.html_len)
+        return page, verdict, reasons
+
     async def _process(self, url, depth):
         host = (urlparse(url).hostname or "").removeprefix("www.")
         state = await self.registry.get(host)
@@ -802,9 +847,7 @@ class Scraper:
         self.stats.fetch_ms += result.elapsed_ms
         self.stats.fetch_n += 1
         if result.error:
-            if result.error in ("hard_timeout", "impersonate", "tiny_body"):
-                await self.registry.mark_failure(host)
-            elif result.status >= 500:
+            if result.error in ("hard_timeout", "impersonate", "tiny_body") or result.status >= 500:
                 await self.registry.mark_failure(host)
             else:
                 await self.registry.mark_success(host)
@@ -824,23 +867,27 @@ class Scraper:
             self.stats.failed += 1
             return
         await self.registry.mark_success(host)
+        self._recent.append(url)
         self.stats.bytes_in += len(result.content)
         t0 = time.monotonic()
-        page = await asyncio.to_thread(self.parser.parse, result.content, url)
-        accepted, qreason = self.gate.check(page.text, page.link_chars, page.html_len)
+        page, verdict, reasons = await asyncio.to_thread(self._parse_and_gate, result.content, url)
         self.stats.parse_ms += (time.monotonic() - t0) * 1000
         self.stats.parse_n += 1
-        if not accepted:
+        if verdict == "reject":
             self.stats.rejected += 1
-            self.stats.quality_reasons[qreason] += 1
-            return
-        self.writer.add(page.title, page.text)
-        self.stats.ok += 1
-        self.stats.bytes_out += len(page.text)
-        self._recent.append(url)
-        if len(self._recent) > 10:
-            self._recent.pop(0)
-        if depth < self.cfg.max_depth:
+            for r in reasons:
+                self.stats.quality_reasons[r] += 1
+        elif verdict == "flagged":
+            self.stats.flagged += 1
+            for r in reasons:
+                self.stats.quality_reasons[r] += 1
+            self.writer_flagged.add(page.title, page.text, ",".join(reasons))
+            self.stats.bytes_out += len(page.text)
+        else:
+            self.stats.ok += 1
+            self.writer_good.add(page.title, page.text)
+            self.stats.bytes_out += len(page.text)
+        if depth < self.cfg.max_depth and page.links:
             await self.frontier.push_many(page.links, depth + 1)
         if self.cfg.max_pages and self.stats.pages() >= self.cfg.max_pages:
             await self.frontier.close()
@@ -856,10 +903,12 @@ class Scraper:
         fetch_avg = self.stats.fetch_ms / max(1, self.stats.fetch_n)
         parse_avg = self.stats.parse_ms / max(1, self.stats.parse_n)
         self._log.info(
-            "ok=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d protected=%d chunks=%d records=%d rate=%.1f/s in=%.1fMB out=%.1fMB fetch=%.0fms parse=%.0fms",
-            self.stats.ok, self.stats.blocked, self.stats.failed, self.stats.rejected,
-            self.stats.dedup, self.frontier.queue_size(), self.registry.size(),
-            self.registry.protected_count(), self.writer._index, self.writer._count,
+            "ok=%d flagged=%d blocked=%d failed=%d rejected=%d dedup=%d queue=%d domains=%d protected=%d chunks=%d records=%d fchunks=%d frecords=%d rate=%.1f/s in=%.1fMB out=%.1fMB fetch=%.0fms parse=%.0fms",
+            self.stats.ok, self.stats.flagged, self.stats.blocked, self.stats.failed,
+            self.stats.rejected, self.stats.dedup, self.frontier.queue_size(),
+            self.registry.size(), self.registry.protected_count(),
+            self.writer_good._index, self.writer_good._total,
+            self.writer_flagged._index, self.writer_flagged._total,
             rate, self.stats.bytes_in / 1048576, self.stats.bytes_out / 1048576,
             fetch_avg, parse_avg,
         )
@@ -868,15 +917,15 @@ class Scraper:
         self._log_stats()
         self._log.info("block_reasons=%s", self.stats.block_reasons.most_common(10))
         self._log.info("quality_reasons=%s", self.stats.quality_reasons.most_common(12))
-        seeds = self._recent[-5:] if self._recent else []
+        seeds = list(self._recent)[-5:]
         tmp = Path(str(self.cfg.session_zip) + ".tmp")
         try:
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr("frontier.txt", "\n".join(seeds))
                 zf.writestr("meta.json", json.dumps({
-                    "ok": self.stats.ok, "blocked": self.stats.blocked,
-                    "failed": self.stats.failed, "rejected": self.stats.rejected,
-                    "pages": self.stats.pages(),
+                    "ok": self.stats.ok, "flagged": self.stats.flagged,
+                    "blocked": self.stats.blocked, "failed": self.stats.failed,
+                    "rejected": self.stats.rejected, "pages": self.stats.pages(),
                 }))
             os.replace(tmp, self.cfg.session_zip)
         except Exception as e:
@@ -895,7 +944,7 @@ def _load_config():
             data = tomllib.loads(toml_path.read_text())
             for k, v in data.items():
                 if hasattr(cfg, k):
-                    if k == "output_dir" or k == "session_zip":
+                    if k in ("output_dir", "session_zip"):
                         v = Path(v)
                     setattr(cfg, k, v)
         except Exception as e:
